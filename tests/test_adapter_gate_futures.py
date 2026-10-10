@@ -6,7 +6,8 @@ from decimal import Decimal
 
 import pytest
 
-from adapter_fakes import NOW, WALL_MS, FakeHttp, FakeResponse, JsonOnlyResponse, fixture_json, fixture_text, reply, source
+from adapter_fakes import (NOW, WALL_MS, FakeHttp, FakeResponse, JsonOnlyResponse, fixture_json, fixture_text,
+                           reply, source)
 from gate_stonk.errors import ConfigError, TransientUnsafe, Unsafe
 from gate_stonk.feeds.base import Update
 from gate_stonk.feeds.gate_futures import GateFuturesAdapter
@@ -215,3 +216,58 @@ def test_scaled_contract_rejected():
 def test_contract_lookup_rate_limited_is_transient():
     info, _ = info_for('rest_error_429.json', 429)
     assert info['reason'] == 'REFERENCE_LOOKUP_FAILED:HTTP_429' and info['transient'] is True
+
+
+# --------------------------------------------------------------------------- with the real worker
+def test_worker_passes_size_decimal_header_on_connect():
+    from gate_stonk.feeds.ws import WsWorker
+
+    class Conn:
+        def __init__(self):
+            self.frames = [fixture_text(V, 'ws_sub_ack.json'), fixture_text(V, 'ws_book_ticker.json')]
+            self.sent = []
+
+        def settimeout(self, value):
+            pass
+
+        def send(self, text):
+            self.sent.append(text)
+
+        def recv(self):
+            return self.frames.pop(0) if self.frames else ''
+
+        def ping(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Sink:
+        def __init__(self):
+            self.published = []
+
+        def publish(self, update):
+            self.published.append(update)
+
+        def invalidate(self, key, reason):
+            pass
+
+        def set_connected(self, key, connected):
+            pass
+
+        def connection_reset(self, keys):
+            pass
+
+        def should_reconnect(self, stream, now, keys):
+            return False
+
+    conn, sink, opened = Conn(), Sink(), []
+
+    def connect(url, timeout, **options):
+        opened.append((url, options))
+        return conn
+
+    WsWorker(make(), sink, timeout=5, connect=connect, wait=lambda seconds: True).run()
+    assert opened == [('wss://fx-ws.gateio.ws/v4/ws/usdt', {'header': {'X-Gate-Size-Decimal': '1'}})]
+    assert [u.kind for u in sink.published] == ['book']
+    assert sink.published[0].book.update_id == 5213871234

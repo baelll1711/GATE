@@ -461,3 +461,23 @@ def test_worker_bad_data_invalidates_only_its_key_and_disconnect_drops_the_book(
     after = hub.source_snapshot('src')
     assert after.book is None and after.error == 'DISCONNECTED' and not after.connected
     assert hub.source_snapshot('other').book is not None      # another key is untouched
+
+
+def test_prepare_hook_runs_before_connect_and_failure_backs_off(clock):
+    """Adapters may resolve metadata (Lighter market index) before subscribing; failures retry with backoff."""
+    class PreparingAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.prepared = 0
+
+        def prepare(self):
+            self.prepared += 1
+            if self.prepared == 1:
+                raise ConnectionError('lookup failed')
+
+    adapter, sink = PreparingAdapter(), FakeSink()
+    harness = Harness(adapter, sink, [FakeConn([''], clock)], clock)
+    harness.run()
+    assert adapter.prepared == 3                       # failed, succeeded (connected), then plan exhausted
+    assert harness.reasons[0] == 'ConnectionError'     # first attempt never reached connect()
+    assert len(harness.calls) == 2 and harness.waits[0] == 1.0

@@ -7,7 +7,8 @@ from decimal import Decimal
 
 import pytest
 
-from adapter_fakes import NOW, WALL_MS, FakeHttp, FakeResponse, JsonOnlyResponse, fixture_text, gz, reply, source
+from adapter_fakes import (NOW, WALL_MS, FakeHttp, FakeResponse, JsonOnlyResponse, fixture_json, fixture_text, gz,
+                           reply, source)
 from gate_stonk.errors import ConfigError, TransientUnsafe, Unsafe
 from gate_stonk.feeds.base import Reply, Update
 from gate_stonk.feeds.bingx import BingxAdapter
@@ -247,3 +248,76 @@ def test_scaled_contract_rejected():
 def test_contracts_rate_limited_is_transient():
     info, _ = info_for('rest_rate_limited.json')
     assert info['reason'] == 'REFERENCE_LOOKUP_FAILED:INVALID_BINGX_CONTRACTS:100410' and info['transient'] is True
+
+
+# --------------------------------------------------------------------------- with the real worker
+class FakeConnection:
+    def __init__(self, frames: list):
+        self.frames = list(frames)
+        self.sent: list[str] = []
+        self.closed = False
+
+    def settimeout(self, value: float) -> None:
+        pass
+
+    def send(self, text: str) -> None:
+        self.sent.append(text)
+
+    def recv(self):
+        return self.frames.pop(0) if self.frames else b''
+
+    def ping(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RecordingSink:
+    def __init__(self):
+        self.published: list[Update] = []
+        self.invalidated: list[tuple[str, str]] = []
+
+    def publish(self, update: Update) -> None:
+        self.published.append(update)
+
+    def invalidate(self, key: str, reason: str) -> None:
+        self.invalidated.append((key, reason))
+
+    def set_connected(self, key: str, connected: bool) -> None:
+        pass
+
+    def connection_reset(self, keys) -> None:
+        pass
+
+    def should_reconnect(self, stream, now, keys) -> bool:
+        return False
+
+
+def test_worker_drives_gzip_frames_and_answers_ping_uncompressed():
+    from gate_stonk.feeds.ws import WsWorker
+    conn = FakeConnection([gz('Ping'), gz(fixture_text(V, 'ws_ack.json')), gz(fixture_text(V, 'ws_depth5.json'))])
+    opened = []
+
+    def connect(url, timeout, **options):
+        opened.append((url, options))
+        return conn
+
+    adapter = make()
+    sink = RecordingSink()
+    WsWorker(adapter, sink, timeout=5, connect=connect, wait=lambda seconds: True).run()
+    assert opened == [('wss://open-api-swap.bingx.com/swap-market', {})]
+    assert json.loads(conn.sent[0])['dataType'] == 'STONK-USDT@depth5@500ms'       # subscription first
+    assert conn.sent[1] == 'Pong'                                                  # plain text reply
+    assert [u.kind for u in sink.published] == ['book']
+    assert sink.published[0].book.ask == D('0.13600')
+    assert ('bingx_perp', 'DISCONNECTED') in sink.invalidated
+
+
+def test_failed_frame_of_a_foreign_stream_does_not_touch_our_key():
+    frame = fixture_json(V, 'ws_depth5_data_error.json')
+    frame['dataType'] = 'BTC-USDT@depth5@500ms'
+    assert make().on_text(json.dumps(frame), NOW, WALL_MS) == []
+    frame = fixture_json(V, 'ws_depth5.json')
+    frame['code'] = 'zero'
+    assert only(make().on_text(json.dumps(frame), NOW, WALL_MS)).error == 'INVALID_WS_BOOK:bingx_perp'

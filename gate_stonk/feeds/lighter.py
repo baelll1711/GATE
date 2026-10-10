@@ -119,6 +119,7 @@ class LighterAdapter(AdapterBase):
         self._asks: dict[Decimal, Decimal] = {}
         self._nonce: int | None = None
         self._synced = False
+        self._prepare_http: Any = None
 
     def _check_symbol(self) -> None:
         if not _SYMBOL.fullmatch(self.symbol):
@@ -152,6 +153,21 @@ class LighterAdapter(AdapterBase):
             raise Unsafe(f'LIGHTER_MARKET_INDEX_MISMATCH:{self._market_index}')
         self._market_index = index
         return index
+
+    def prepare(self, http: Any = None) -> None:
+        """Worker hook before every connection: resolve the market index over REST once.
+
+        A failure propagates to the worker, which treats it as a failed connection attempt
+        (logged, normal reconnect backoff); nothing is subscribed without a verified index.
+        """
+        if self._market_index is not None:
+            return
+        if http is None:
+            if self._prepare_http is None:
+                import requests
+                self._prepare_http = requests.Session()
+            http = self._prepare_http
+        self.resolve_market_index(http)
 
     # ------------------------------------------------------------------ websocket
     def subscribe_frames(self) -> list[str]:

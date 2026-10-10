@@ -6,7 +6,8 @@ from decimal import Decimal
 
 import pytest
 
-from adapter_fakes import NOW, WALL_MS, FakeHttp, FakeResponse, JsonOnlyResponse, fixture_json, fixture_text, reply, source
+from adapter_fakes import (NOW, WALL_MS, FakeHttp, FakeResponse, JsonOnlyResponse, fixture_json, fixture_text,
+                           reply, source)
 from gate_stonk.errors import ConfigError, TransientUnsafe, Unsafe
 from gate_stonk.feeds.base import Reply, Update
 from gate_stonk.feeds.lighter import PUBLISH_DEPTH, LighterAdapter
@@ -299,7 +300,8 @@ def test_rest_snapshot_drops_possibly_incomplete_deepest_level_when_truncated():
 
 
 def test_rest_snapshot_with_mark_from_details():
-    http = FakeHttp({ORDERS: reply(V, 'rest_order_book_orders.json'), DETAILS: reply(V, 'rest_order_book_details.json')})
+    http = FakeHttp({ORDERS: reply(V, 'rest_order_book_orders.json'),
+                     DETAILS: reply(V, 'rest_order_book_details.json')})
     _, ticker = make('mark').rest_snapshot(http, 4.0, NOW, WALL_MS)
     assert ticker.ticker == Ticker(mark=D('0.13593'), last=D('0.13592'), received=NOW, event_ms=WALL_MS)
     assert http.call(DETAILS)['params'] == {'market_id': 4100, 'filter': 'perp'}
@@ -321,3 +323,25 @@ def test_rest_snapshot_failures():
     http = FakeHttp({ORDERS: FakeResponse(200, '{"code":200,"asks":[],"bids":[]}')})
     with pytest.raises(Unsafe, match='^EMPTY_BOOK_SIDE$'):
         make().rest_snapshot(http, 4.0, NOW, WALL_MS)
+
+
+def test_rest_poll_interval_respects_anonymous_rate_limit():
+    assert make().rest_min_interval == 2.0
+    assert make('mark').rest_min_interval == 4.0
+
+
+def test_prepare_resolves_market_index_before_subscribing():
+    adapter = make(market_index=None)
+    calls = []
+
+    def fake_resolve(http, timeout=None):
+        calls.append(http)
+        adapter._market_index = 4100
+        return 4100
+
+    adapter.resolve_market_index = fake_resolve
+    adapter.prepare(http='fake-http')
+    assert calls == ['fake-http'] and adapter.market_index == 4100
+    adapter.prepare(http='other')            # already resolved: no second lookup
+    assert calls == ['fake-http']
+    assert 'order_book/4100' in adapter.subscribe_frames()[0]

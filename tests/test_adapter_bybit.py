@@ -292,3 +292,45 @@ def test_instrument_lookup_failures(answer, reason, transient):
     http = FakeHttp({'/v5/market/instruments-info': answer})
     info = make().instrument_info(http, 4.0)
     assert info['ok'] is False and info['reason'] == reason and info['transient'] is transient
+
+
+# --------------------------------------------------------------------------- shared helpers
+class BytesResponse:
+    """requests-like response whose ``text`` would be mis-decoded; raw UTF-8 ``content`` wins."""
+
+    status_code = 200
+
+    def __init__(self, raw: bytes):
+        self.content = raw
+        self.text = raw.decode('latin-1')
+
+    def json(self):            # pragma: no cover - must not be used when content is available
+        raise AssertionError('content must be preferred')
+
+
+def test_rest_body_prefers_raw_utf8_content():
+    raw = fixture_text(V, 'rest_orderbook.json').replace('"retMsg":"OK"', '"retMsg":"ОК ✓"').encode('utf-8')
+    http = FakeHttp({'/v5/market/orderbook': BytesResponse(b'\xef\xbb\xbf' + raw)})       # with a BOM
+    assert only(make().rest_snapshot(http, 4.0, NOW, WALL_MS)).book.ask == D('0.1360')
+
+
+@pytest.mark.parametrize('base, scaled', [
+    ('STONK', False), ('1INCH', False), ('1000STONK', True), ('10000STONK', True), ('1MBABYDOGE', True),
+    ('1KSTONK', True), ('10STONK', True), (None, False),
+])
+def test_scaled_base_detection(base, scaled):
+    from gate_stonk.feeds._venue_common import is_scaled_base
+    assert is_scaled_base(base) is scaled
+
+
+def test_strict_integer_and_price_helpers():
+    from gate_stonk.feeds._venue_common import as_int, opt_price
+    assert as_int('1791640000123') == 1791640000123 and as_int(D('5')) == 5 and as_int(7.0) == 7
+    for bad in (True, -1, '1.5', D('1.5'), '', '١٢', float('nan'), None):
+        with pytest.raises(ValueError):
+            as_int(bad)
+    assert opt_price('') is None and opt_price(None) is None and opt_price('0') is None
+    assert opt_price('0.1359') == D('0.1359')
+    for bad in ('-1', 'NaN', 'Infinity', True):
+        with pytest.raises(ValueError):
+            opt_price(bad)

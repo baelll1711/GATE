@@ -106,18 +106,21 @@ class BingxAdapter(AdapterBase):
             return [Reply(dumps({'pong': msg['ping'], 'time': msg.get('time')}))]
         if not data_type:
             return self._envelope_frame(msg)
-        if 'code' in msg:
+        is_depth = data_type == self.depth_type or (
+            isinstance(data_type, str) and data_type.startswith(self._depth_prefix + '@'))
+        is_ticker = self.wants_ticker and data_type == self.ticker_type
+        if not (is_depth or is_ticker):
+            return []                    # another stream: never touches our key
+        if 'code' in msg:                # "code": 0 in data frames is NOT an error
             try:
                 code = as_code(msg['code'])
             except ValueError:
-                return [self.error(self.book_code)]
+                return [self.error(self.book_code if is_depth else self.ticker_code)]
             if code != 0:
                 return [self.error(f'BINGX_DATA_ERROR:{code}')]
-        if data_type == self.depth_type or (isinstance(data_type, str) and data_type.startswith(self._depth_prefix + '@')):
+        if is_depth:
             return self.guard(self.book_code, self._book, msg, now)
-        if data_type == self.ticker_type and self.wants_ticker:
-            return self.guard(self.ticker_code, self._ticker, msg, now)
-        return []
+        return self.guard(self.ticker_code, self._ticker, msg, now)
 
     def _envelope_frame(self, msg: dict) -> list[Update]:
         """Subscription ack or error envelope (no dataType)."""

@@ -167,6 +167,9 @@ class WsWorker:
         self.attempts += 1
         try:
             self.adapter.on_reset()
+            prepare = getattr(self.adapter, 'prepare', None)
+            if callable(prepare):
+                prepare()          # e.g. Lighter resolves its market index over REST before subscribing
             conn = self._open()
             with self._lock:
                 self._conn = conn
