@@ -1189,7 +1189,9 @@ def _load_env_file(env_path: Path) -> None:
     """``.env`` next to the config, never overriding the real environment.
 
     ``GATE_LIVE_CONFIRM`` is deliberately NOT imported: the live confirmation must
-    be typed in the shell for the current run (``env_file_has_live_confirm``).
+    be typed in the shell for the current run (``env_file_has_live_confirm``). The key
+    is matched case-insensitively: Windows upper-cases ``os.environ`` keys, so a
+    ``gate_live_confirm=`` line would otherwise become ``GATE_LIVE_CONFIRM``.
     """
     if not env_path.is_file():
         return
@@ -1198,9 +1200,14 @@ def _load_env_file(env_path: Path) -> None:
     except (OSError, ValueError) as exc:
         raise ConfigError(f'{env_path.name}: cannot read the .env file ({type(exc).__name__})') from None
     for key, value in values.items():
-        if key == LIVE_CONFIRM_ENV or value is None or key in os.environ:
+        if _is_live_confirm_key(key) or value is None or key in os.environ:
             continue
         os.environ[key] = value
+
+
+def _is_live_confirm_key(key: Any) -> bool:
+    """``GATE_LIVE_CONFIRM`` in any letter case (Windows environment names are case-insensitive)."""
+    return isinstance(key, str) and key.strip().upper() == LIVE_CONFIRM_ENV
 
 
 def load_config(path: str | Path, *, read_env: bool = True) -> Config:
@@ -1224,7 +1231,8 @@ def load_config(path: str | Path, *, read_env: bool = True) -> Config:
 
 
 def env_file_has_live_confirm(cfg: Config | str | Path) -> bool:
-    """True if the ``.env`` next to the config defines GATE_LIVE_CONFIRM (any value).
+    """True if the ``.env`` next to the config defines GATE_LIVE_CONFIRM (any value, key in
+    any letter case: on Windows ``gate_live_confirm`` IS the same variable).
 
     Live must refuse in that case: the confirmation has to come from the shell.
     An unreadable ``.env`` counts as True (fail closed). Accepts a Config, the
@@ -1245,4 +1253,4 @@ def env_file_has_live_confirm(cfg: Config | str | Path) -> bool:
         LOG.warning('.env next to the config cannot be read (%s); treating live confirmation as present',
                     type(exc).__name__)
         return True
-    return LIVE_CONFIRM_ENV in values
+    return any(_is_live_confirm_key(key) for key in values)

@@ -961,6 +961,19 @@ def test_env_file_next_to_config_does_not_override_shell(tmp_path, sample, monke
     assert env_file_has_live_confirm(cfg) is True
 
 
+@pytest.mark.parametrize('name', ['gate_live_confirm', 'Gate_Live_Confirm', ' GATE_LIVE_CONFIRM'])
+def test_env_file_live_confirm_any_case_is_never_imported(tmp_path, sample, monkeypatch, name):
+    """Regression: Windows upper-cases os.environ keys, so a lowercase/mixed-case
+    GATE_LIVE_CONFIRM in .env used to be imported as GATE_LIVE_CONFIRM and passed the
+    shell-only live gate. Any spelling is skipped and reported as present in .env."""
+    track_env(monkeypatch, 'GATE_LIVE_CONFIRM', name.strip(), 'GATE_EXTRA_SETTING')
+    (tmp_path / '.env').write_text(f'GATE_EXTRA_SETTING=1\n{name}=I_UNDERSTAND_SPOT_TRADING\n', encoding='utf-8')
+    cfg = load_config(write(tmp_path, sample))
+    assert os.environ['GATE_EXTRA_SETTING'] == '1'
+    assert not any(key.upper() == 'GATE_LIVE_CONFIRM' for key in os.environ)
+    assert env_file_has_live_confirm(cfg) is True
+
+
 def test_env_file_ignored_without_read_env(tmp_path, sample, monkeypatch):
     track_env(monkeypatch, 'GATE_API_KEY')
     (tmp_path / '.env').write_text('GATE_API_KEY=from-file\n', encoding='utf-8')
@@ -986,6 +999,9 @@ def test_env_file_elsewhere_is_not_read(tmp_path, sample, monkeypatch):
     ('GATE_API_KEY=x\nGATE_LIVE_CONFIRM=\n', True),
     ('GATE_LIVE_CONFIRM\n', True),
     ('﻿GATE_LIVE_CONFIRM=wrong\n', True),
+    ('gate_live_confirm=I_UNDERSTAND_SPOT_TRADING\n', True),          # Windows: the same variable
+    ('Gate_Live_Confirm=I_UNDERSTAND_SPOT_TRADING\n', True),
+    ('GATE_LIVE_CONFIRMED=x\n', False),
 ])
 def test_env_file_has_live_confirm(tmp_path, sample, content, expected):
     if content is not None:

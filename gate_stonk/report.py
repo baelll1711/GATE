@@ -25,12 +25,23 @@ Metric definitions (edge: positive = favourable to us; reference ``_edge``):
   ``fill_ratio_pct = orders_with_fills / orders * 100`` (an ORDER COUNT ratio, not qty).
 * ``filled_qty``, ``filled_notional_usdt`` (gross ``qty*price``), ``avg_fill_price`` =
   notional / qty (pre-fee VWAP; None for a group mixing BUY and SELL).
-* ``avg_edge_at_placement_pct`` = unweighted mean of ``edge(side, placement price,
-  order.center_price)`` over ``orders``; the placement price is the price the order was
-  created at (an amend changes ``order.price`` but not the placement centre, the first
-  ``prior_prices`` entry keeps the original price).
-* ``avg_edge_of_fills_vs_placement_index_pct`` = fill-qty-weighted ``edge(side,
-  fill.price, order.center_price)`` (the center the order was priced from).
+* Two references. INDEX ``I`` (``order.index_price`` at placement, the marks ``I(t)``):
+  every ``*_index*`` edge and the markouts use it, so placement, at-fill and markout
+  values are directly comparable (reference §7.1 reading: at-fill clearly worse than
+  vs-placement = adverse selection). CENTRE ``C = I * (1 + basis_offset_pct / 100)``
+  (``order.center_price``, the price the ladder was built from): the ``*_vs_center`` /
+  ``*_center_*`` fields; they differ from the index ones by about the basis offset.
+* ``avg_edge_at_placement_vs_index_pct`` / ``avg_edge_at_placement_vs_center_pct`` =
+  unweighted mean of ``edge(side, placement price, order.index_price / center_price)``
+  over ``orders``; the placement price is the price the order was created at (an amend
+  changes ``order.price`` but not the placement index/centre, the first ``prior_prices``
+  entry keeps the original price).
+* ``avg_edge_of_fills_vs_placement_index_pct`` / ``avg_edge_of_fills_vs_placement_center_pct``
+  = fill-qty-weighted ``edge(side, fill.price, order.index_price / center_price)``.
+* Known limitation: an amended order keeps its CREATION index/centre (the store does not
+  record the centre an amend was priced from), so fills of amended orders are measured
+  against the creation reference in the two "vs placement" fill metrics. Amend
+  repricing (``execution.reprice_via_amend``) is off by default.
 * ``avg_edge_of_fills_vs_index_at_fill_pct`` = qty-weighted ``edge(side, fill.price,
   I(T))`` over fills that have a mark at execution time T (``fills_with_index_at_fill``).
 * ``markout_{5,30,60}s_pct`` = qty-weighted ``edge(side, fill.price, I(T + h))`` — the
@@ -46,6 +57,17 @@ Metric definitions (edge: positive = favourable to us; reference ``_edge``):
 * ``fees``: per currency over window fills (``fee`` by ``fee_currency`` plus ``GT``
   = Σ ``gt_fee`` and ``POINT`` = Σ ``point_fee``); ``fees_usdt_equiv`` = quote fees +
   base fees × fill price (GT/POINT/other currencies are not converted).
+* ``order_rebates``: the order-level ``rebated_fee`` Gate reports on finished orders
+  (table ``order_rebates``, latest value per order). It is NOT part of the ledger replay
+  (cost, realized); it is listed separately per currency for the campaign and for the
+  window (an order belongs to the window by its ``created_ms``) and per slot, and
+  ``realized_incl_quote_rebates_usdt`` = campaign ``realized_usdt`` + quote-currency
+  rebates (a rebate lowers costs; other currencies are not converted).
+* ``limitations`` (paper only): paper does not model the queue at a price level nor the
+  priority / taker fee of an iceberg's hidden part (the whole order is treated as
+  visible) and fills only on a trade strictly through the price, so its fill ratios and
+  edges are not directly comparable with live; ``iceberg_slots`` = window slots with an
+  iceberg order.
 * Profit: the position is replayed from ALL fills and transfers (execution order, as
   the live ledger). ``realized_usdt`` (campaign) / ``realized_in_window_usdt`` per SELL
   slot = Σ realized of that slot's SELL fills (attribution of the shared average-cost
@@ -201,8 +223,15 @@ def _read(db: sqlite3.Connection, obs_from: int | None, obs_to: int) -> dict:
            for r in db.execute('SELECT ts_ms,"index" AS idx,center,ok,reason,spot_bid,spot_ask FROM index_obs WHERE '
                                + ' AND '.join(clauses) + ' ORDER BY ts_ms, rowid', params)]
     external_fills = int(db.execute('SELECT COUNT(*) FROM external_fills').fetchone()[0])
+    try:
+        rebates = [{'order_id': r['order_id'], 'text': r['text'], 'rebated_fee': D(r['rebated_fee']),
+                    'currency': r['rebated_fee_currency'], 'recorded_ms': int(r['recorded_ms'])}
+                   for r in db.execute('SELECT order_id,text,rebated_fee,rebated_fee_currency,recorded_ms '
+                                       'FROM order_rebates ORDER BY recorded_ms, order_id')]
+    except sqlite3.OperationalError:        # database created before the table existed
+        rebates = []
     return {'meta': meta, 'orders': orders, 'fills': fills, 'transfers': transfers, 'marks': marks, 'obs': obs,
-            'external_fills': external_fills}
+            'external_fills': external_fills, 'rebates': rebates}
 
 
 def _currencies(meta: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -236,18 +265,23 @@ def _group_metrics(ctx: _Context, sides: set[str], orders: list[dict], fills: li
     qty = sum((f['qty'] for f in fills), ZERO)
     notional = sum((f['notional'] for f in fills), ZERO)
     single_side = len({f['side'] for f in fills}) == 1
-    placement = [e for e in (edge_pct(o['side'], _placement_price(o), o['center_price']) for o in placed)
-                 if e is not None]
-    vs_placement: list[tuple[Decimal, Decimal]] = []
+    placement_index = [e for e in (edge_pct(o['side'], _placement_price(o), o['index_price']) for o in placed)
+                       if e is not None]
+    placement_center = [e for e in (edge_pct(o['side'], _placement_price(o), o['center_price']) for o in placed)
+                        if e is not None]
+    vs_placement_index: list[tuple[Decimal, Decimal]] = []
+    vs_placement_center: list[tuple[Decimal, Decimal]] = []
     marked: dict[int, list[tuple[Decimal, Decimal]]] = {h: [] for h in MARK_HORIZONS}
     fees: dict[str, Decimal] = {ctx.base: ZERO, ctx.quote: ZERO, 'GT': ZERO, 'POINT': ZERO}
     fees_equiv = ZERO
     for f in fills:
         order = ctx.orders_by_text.get(f['text'])
         if order is not None:
-            edge = edge_pct(f['side'], f['price'], order['center_price'])
-            if edge is not None:
-                vs_placement.append((edge, f['qty']))
+            for reference, bucket in ((order['index_price'], vs_placement_index),
+                                      (order['center_price'], vs_placement_center)):
+                edge = edge_pct(f['side'], f['price'], reference)
+                if edge is not None:
+                    bucket.append((edge, f['qty']))
         for horizon in MARK_HORIZONS:
             edge = edge_pct(f['side'], f['price'], ctx.mark(f, horizon))
             if edge is not None:
@@ -274,14 +308,20 @@ def _group_metrics(ctx: _Context, sides: set[str], orders: list[dict], fills: li
         'filled_qty': qty,
         'filled_notional_usdt': notional,
         'avg_fill_price': notional / qty if qty and single_side else None,
-        'avg_edge_at_placement_pct': sum(placement, ZERO) / len(placement) if placement else None,
-        'avg_edge_of_fills_vs_placement_index_pct': _weighted(vs_placement),
+        # index reference (comparable with the at-fill marks and the markouts)
+        'avg_edge_at_placement_vs_index_pct': (sum(placement_index, ZERO) / len(placement_index)
+                                               if placement_index else None),
+        'avg_edge_of_fills_vs_placement_index_pct': _weighted(vs_placement_index),
         'avg_edge_of_fills_vs_index_at_fill_pct': _weighted(marked[0]),
         'fills_with_index_at_fill': len(marked[0]),
     }
     for horizon in MARKOUT_SECONDS:
         result[f'markout_{horizon}s_pct'] = _weighted(marked[horizon])
         result[f'fills_with_markout_{horizon}s'] = len(marked[horizon])
+    # centre reference (the price the ladder was built from; differs by the basis offset)
+    result['avg_edge_at_placement_vs_center_pct'] = (sum(placement_center, ZERO) / len(placement_center)
+                                                     if placement_center else None)
+    result['avg_edge_of_fills_vs_placement_center_pct'] = _weighted(vs_placement_center)
     result['median_rest_seconds'] = _median(rested)
     result['placement_rules'] = dict(sorted(Counter(o['reason'] for o in placed).items()))
     result['cancel_reasons'] = dict(sorted(Counter(o['cancel_reason'] for o in placed if o['cancel_reason']).items()))
@@ -349,6 +389,36 @@ def _basis(rows: Sequence[Mapping[str, Any]]) -> dict:
     stats = distribution(values)
     return {'definition': '(spot_mid / index - 1) * 100', 'count': stats['count'],
             **{f'{key}_pct': stats[key] for key in ('mean', 'median', 'p5', 'p95', 'min', 'max')}}
+
+
+def _order_rebates(rows: Sequence[Mapping[str, Any]], orders_by_text: Mapping[str, dict],
+                   in_window: Callable[[int], bool], quote: str, realized: Decimal) -> dict:
+    """Order-level ``rebated_fee`` per currency: campaign, window, per window slot."""
+    campaign: dict[str, Decimal] = {}
+    window: dict[str, Decimal] = {}
+    by_slot: dict[str, dict[str, Decimal]] = {}
+    window_orders = 0
+    for row in rows:
+        amount, currency = row['rebated_fee'], row['currency'] or 'UNKNOWN'
+        campaign[currency] = campaign.get(currency, ZERO) + amount
+        order = orders_by_text.get(row['text']) if row['text'] else None
+        if not in_window(int(order['created_ms']) if order is not None else row['recorded_ms']):
+            continue
+        window_orders += 1
+        window[currency] = window.get(currency, ZERO) + amount
+        slot = by_slot.setdefault(order['slot'] if order is not None else 'unknown', {})
+        slot[currency] = slot.get(currency, ZERO) + amount
+    return {'definition': 'order-level rebated_fee (Gate); not included in cost / realized of the ledger',
+            'in_ledger': False, 'orders': len(rows), 'orders_in_window': window_orders,
+            'campaign': dict(sorted(campaign.items())), 'window': dict(sorted(window.items())),
+            'by_slot': {slot: dict(sorted(v.items())) for slot, v in sorted(by_slot.items(),
+                                                                            key=lambda kv: _slot_sort_key(kv[0]))},
+            'realized_incl_quote_rebates_usdt': realized + campaign.get(quote, ZERO)}
+
+
+PAPER_LIMITATIONS = ('paper: the queue at a price level and the priority / taker fee of the hidden iceberg part '
+                     'are not modelled (the whole order is treated as visible); a fill needs a trade strictly '
+                     'through the price; fill ratios and edges are not directly comparable with live')
 
 
 def _position_block(position: Position, initial_avg_price: Decimal | None) -> dict:
@@ -461,6 +531,8 @@ def build_report(store: Any, *, hours: float | int | Decimal | None = None, now_
     window_start = since_ms if since_ms is not None else (
         int(start_ms) if start_ms is not None else (window_obs[0]['ts_ms'] if window_obs else None))
     external = meta.get('external_activity')
+    orders_by_text = ctx.orders_by_text
+    iceberg_slots = sorted({o['slot'] for o in window_orders if o.get('iceberg')}, key=_slot_sort_key)
     return {
         'generated_ms': now_ms,
         'window_hours': None if hours is None else D(hours),
@@ -479,6 +551,9 @@ def build_report(store: Any, *, hours: float | int | Decimal | None = None, now_
         'sides': side_report,
         'totals': totals,
         'position': _position_block(position, initial),
+        'order_rebates': _order_rebates(data['rebates'], orders_by_text, in_window, quote, position.realized),
+        'limitations': PAPER_LIMITATIONS if identity.get('mode') == 'paper' else None,
+        'iceberg_slots': iceberg_slots,
         'index': _index_stats(window_obs, now_ms, window_start),
         'basis': _basis(window_obs),
         'marks': {'bracket_ms': MARK_BRACKET_MS, 'horizons_s': list(MARK_HORIZONS),
@@ -515,10 +590,15 @@ def _row(name: str, m: Mapping[str, Any]) -> list[str]:
     return [name, str(m['orders']), str(m['orders_with_fills']), _n(m['fill_ratio_pct'], 1), str(m['fills']),
             fmt(m['filled_qty']), usd(m['filled_notional_usdt']),
             fmt(m['avg_fill_price'], 8) if m['avg_fill_price'] is not None else 'н/д',
-            _p(m['avg_edge_at_placement_pct']), _p(m['avg_edge_of_fills_vs_placement_index_pct']),
+            _p(m['avg_edge_at_placement_vs_index_pct']), _p(m['avg_edge_of_fills_vs_placement_index_pct']),
             f"{_p(m['avg_edge_of_fills_vs_index_at_fill_pct'])} ({m['fills_with_index_at_fill']})",
             *(_p(m[f'markout_{h}s_pct']) for h in MARKOUT_SECONDS),
+            _p(m['avg_edge_at_placement_vs_center_pct']), _p(m['avg_edge_of_fills_vs_placement_center_pct']),
             'н/д' if realized is None else signed(realized)]
+
+
+def _amounts(mapping: Mapping[str, Decimal]) -> str:
+    return '; '.join(f'{currency} {fmt(amount)}' for currency, amount in mapping.items()) or 'нет'
 
 
 def _counts(mapping: Mapping[str, int]) -> str:
@@ -535,21 +615,31 @@ def format_report_ru(report: Mapping[str, Any]) -> str:
         period = f"за всю кампанию (по {utc_text(report['until_ms'])})"
     lines = [f"Отчёт {report.get('mode') or 'н/д'} '{report.get('campaign_id') or 'н/д'}' "
              f"({report['currency_pair']}) {period}."]
+    if report.get('mode') == 'paper':
+        lines.append('Ограничения paper: очередь на уровне цены и приоритет/taker-комиссия скрытой части iceberg '
+                     'не моделируются (вся заявка считается видимой); исполнение только сделкой строго через цену. '
+                     'Доля исполнений и края не сопоставимы с live напрямую.')
+        if report.get('iceberg_slots'):
+            lines.append(f"Iceberg-слоты в окне: {', '.join(report['iceberg_slots'])} — в paper их скрытая часть "
+                         'исполняется как видимая.')
     if report.get('account_review_required'):
         lines.append('ВНИМАНИЕ: обнаружена посторонняя активность на аккаунте, позиция требует сверки. '
                      f"Ниже учтены только исполнения собственных заявок (посторонних исполнений отложено: "
                      f"{report.get('external_fills_excluded', 0)}).")
     header = ['Слот', 'Заявок', 'С исп.', 'Fill,%', 'Исп.', f'Объём {base}', f'Сумма {quote}', 'Ср. цена',
-              'Выст.,%', 'Исп./выст.,%', 'Исп./индекс,% (n)',
-              *(f'{h} с,%' for h in MARKOUT_SECONDS), f'Реал. за окно, {quote}']
+              'Выст./инд.,%', 'Исп./инд. выст.,%', 'Исп./индекс,% (n)',
+              *(f'{h} с,%' for h in MARKOUT_SECONDS), 'Выст./центр,%', 'Исп./центр,%', f'Реал. за окно, {quote}']
     rows = [_row(slot, metrics) for slot, metrics in report['slots'].items()]
     rows += [_row(f'Итого {side.upper()}', report['sides'][side]) for side in SIDES]
     rows.append(_row('Всего', report['totals']))
     lines.extend(_table(header, rows))
     lines.append('Края в % (плюс — в нашу пользу): BUY (эталон − цена)/эталон×100, SELL (цена − эталон)/эталон×100. '
-                 '«Выст.» — заявки к центру при выставлении; «Исп./выст.» — исполнения к тому же центру; '
-                 '«Исп./индекс» — к индексу в момент исполнения (±1 с, n — исполнений с отметкой); '
+                 'Эталон — индекс I, как у отметок и маркаутов: «Выст./инд.» — цена выставления к индексу при '
+                 'выставлении; «Исп./инд. выст.» — исполнения к тому же индексу; «Исп./индекс» — к индексу в момент '
+                 'исполнения (±1 с, n — исполнений с отметкой); '
                  f"{'/'.join(str(h) for h in MARKOUT_SECONDS)} с — маркауты к индексу через столько секунд. "
+                 '«Выст./центр», «Исп./центр» — то же к центру C = I×(1 + basis_offset_pct/100), от которого '
+                 'строилась лестница (при ненулевом смещении отличаются от индексных на смещение). '
                  'Fill — доля заявок с исполнением (отклонённые и post-only отказы не учитываются).')
     totals, position = report['totals'], report['position']
     rejected = sum(m['orders_rejected'] for m in report['sides'].values())
@@ -559,6 +649,16 @@ def format_report_ru(report: Mapping[str, Any]) -> str:
                  f"за всю кампанию {signed(totals['realized_usdt'])} {quote}; "
                  f"средняя продажа − средняя покупка {_p(totals['avg_sell_minus_avg_buy_pct'])}%; "
                  f"оборот {usd(totals['turnover_usdt'])} {quote}.")
+    rebates = report.get('order_rebates') or {}
+    if rebates.get('orders'):
+        slots = '; '.join(f'{slot}: {_amounts(v)}' for slot, v in rebates['by_slot'].items())
+        lines.append(f"Rebate по заявкам (rebated_fee, уменьшает затраты; в себестоимость и «Реализовано» выше "
+                     f"не входит): за окно {_amounts(rebates['window'])}"
+                     + (f' ({slots})' if slots else '')
+                     + f"; за кампанию {_amounts(rebates['campaign'])}. Реализовано за кампанию с учётом rebate "
+                       f"в {quote}: {signed(rebates['realized_incl_quote_rebates_usdt'])} {quote}.")
+    else:
+        lines.append('Rebate по заявкам (rebated_fee): нет.')
     if totals.get('window_has_unknown_cost_sales'):
         lines.append('В окне есть продажи из прежнего запаса с неизвестной себестоимостью (initial_avg_price не задан).')
     avg = position['avg_cost']

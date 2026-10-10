@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
 import tempfile
 import time
 from decimal import Decimal
@@ -136,6 +138,22 @@ def test_run_gates_refuse_without_network_or_orders(tmp_path, monkeypatch, case)
     assert code in out.text
     assert 'Запуск отклонён' in out.text
     assert not (tmp_path / 'state').exists()       # no DB, no lock, no status, no orders
+
+
+@pytest.mark.parametrize('key', ['gate_live_confirm', 'Gate_Live_Confirm'])
+def test_run_refuses_live_confirm_in_env_file_any_case(tmp_path, monkeypatch, key):
+    """Regression: on Windows os.environ is case-insensitive, so a lowercase key in .env
+    used to reach GATE_LIVE_CONFIRM and pass the shell-only gate. Refused by name, any case."""
+    live_env(monkeypatch, confirm=False)
+    monkeypatch.setenv(key, 'placeholder')
+    monkeypatch.delenv(key)                              # restored (deleted) even if imported
+    path = write_config(tmp_path, make_live)
+    (tmp_path / '.env').write_text(f'{key}=I_UNDERSTAND_SPOT_TRADING\n', encoding='utf-8')
+    out = Output()
+    rc = main(['run', '--live', '--config', str(path)], deps=forbidden_deps(out))
+    assert rc == 2 and 'LIVE_CONFIRM_IN_ENV_FILE' in out.text
+    assert key not in os.environ and 'GATE_LIVE_CONFIRM' not in os.environ
+    assert not (tmp_path / 'state').exists()
 
 
 def test_run_rejects_bad_seconds(tmp_path):
@@ -320,6 +338,118 @@ def test_live_run_clock_skew_is_retried_then_cleared(tmp_path, clock, monkeypatc
     assert venue.calls.count('account_check') == 2
 
 
+class FlakyMetaVenue(FakeLiveVenue):
+    """pair_meta() answers from a script: an exception (outage) or fresh metadata."""
+
+    def __init__(self, metas, **kwargs):
+        super().__init__(**kwargs)
+        self.metas = list(metas)
+
+    def pair_meta(self):
+        self.calls.append('pair_meta')
+        item = self.metas.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        self.meta = item
+        return item
+
+
+def test_live_restart_after_meta_outage_uses_fresh_trade_status(tmp_path, clock, monkeypatch):
+    """Regression: after a metadata outage the startup retry fetched fresh metadata but kept
+    checking (and trading with) the saved snapshot. The pair became untradable meanwhile:
+    the run must be refused with PAIR_NOT_TRADABLE and engine/venue get the fresh meta."""
+    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path / 'tmp'))
+    live_env(monkeypatch)
+    path = write_config(tmp_path, make_live)
+    _store_with_known_order(tmp_path, 'live')                 # saved order -> the snapshot may be used
+    store = Store(tmp_path / 'state' / 'live.sqlite3')
+    store.set_meta(cli.META_SNAPSHOT_KEY, pair_meta().raw)    # snapshot: tradable
+    store.close()
+    fresh = pair_meta(trade_status='untradable', min_quote_amount='5')
+    venue = FlakyMetaVenue([ConnectionError('outage'), fresh])
+    engine = FakeEngine(script={6: KeyboardInterrupt()})      # the saved order never settles with the fake
+    out = Output()
+    main(['run', '--live', '--config', str(path)], deps=live_deps(out, clock, engine, venue, FakeFill(),
+                                                                  FakeNotifier()))
+    assert engine.kwargs['meta'].trade_status == 'tradable'   # built from the snapshot
+    assert engine.stops == ['PAIR_METADATA_UNAVAILABLE', 'PAIR_NOT_TRADABLE:untradable']
+    assert engine.cleared == []                                # the stop is never lifted
+    assert engine.meta is fresh and venue.meta is fresh       # fresh metadata is authoritative
+    assert 'Запуск отклонён: PAIR_NOT_TRADABLE:untradable' in out.text
+    assert 'торговля возобновляется' not in out.text
+    store = Store(tmp_path / 'state' / 'live.sqlite3')
+    try:
+        assert store.meta(cli.META_SNAPSHOT_KEY)['trade_status'] == 'untradable'
+    finally:
+        store.close()
+
+
+# ============================================================================ run: signals
+
+def _capture_runner(monkeypatch) -> list:
+    runners: list = []
+    monkeypatch.setattr(cli.Runner, 'install_signals', lambda self: runners.append(self))
+    return runners
+
+
+class SignalEngine(FakeEngine):
+    """Delivers SIGTERM through the runner's real handler while a step is inside a
+    'venue call' wrapped in a generic handler (as in GateRestClient / venue / engine)."""
+
+    def __init__(self, runners: list, *, at_step: int, guard: type, **kwargs):
+        super().__init__(**kwargs)
+        self.runners, self.at_step, self.guard = runners, at_step, guard
+        self.swallowed: list[str] = []
+
+    def step(self) -> str:
+        result = super().step()
+        if self.steps == self.at_step:
+            try:
+                self.runners[0]._on_signal(signal.SIGTERM, None)
+            except self.guard as exc:            # noqa: PERF203 - the generic handler under test
+                self.swallowed.append(type(exc).__name__)
+        return result
+
+
+@pytest.mark.parametrize('guard,swallowed', [(Exception, []), (BaseException, ['StopRequested'])])
+def test_sigterm_inside_venue_call_with_generic_except_still_stops(tmp_path, clock, monkeypatch, guard, swallowed):
+    """Regression: StopRequested was an Exception, so `except Exception` in the REST/venue/
+    engine code swallowed SIGTERM/SIGBREAK and the bot kept trading. It is a BaseException
+    now, and the recorded stop is re-checked every tick even if something swallowed it."""
+    assert not issubclass(cli.StopRequested, Exception)
+    runners = _capture_runner(monkeypatch)
+    path = write_config(tmp_path)
+    engine = SignalEngine(runners, at_step=3, guard=guard)
+    out = Output()
+    rc = main(['run', '--config', str(path), '--seconds', '30'], deps=paper_deps(out, clock, engine,
+                                                                                  notifier=FakeNotifier()))
+    assert rc == 0, out.text
+    assert engine.swallowed == swallowed
+    assert engine.steps == 3                                   # no step after the signal
+    assert engine.calls[-1] == 'shutdown'
+    status = json.loads((tmp_path / 'state' / 'status.json').read_text(encoding='utf-8'))
+    assert status['process']['exit_reason'] == 'SIGTERM'
+
+
+def test_signal_during_shutdown_does_not_abort_the_shutdown_cancels(tmp_path, clock, monkeypatch):
+    runners = _capture_runner(monkeypatch)
+
+    class ShutdownSignalEngine(FakeEngine):
+        def shutdown(self) -> None:
+            runners[0]._on_signal(signal.SIGTERM, None)        # e.g. the console is closed while stopping
+            super().shutdown()
+
+    path = write_config(tmp_path)
+    engine = ShutdownSignalEngine()
+    out = Output()
+    rc = main(['run', '--config', str(path), '--seconds', '2'], deps=paper_deps(out, clock, engine,
+                                                                                 notifier=FakeNotifier()))
+    assert rc == 0, out.text
+    assert engine.calls[-1] == 'shutdown'                       # the cancels ran to the end
+    status = json.loads((tmp_path / 'state' / 'status.json').read_text(encoding='utf-8'))
+    assert status['process']['exit_reason'].startswith('истекло --seconds')
+
+
 # ============================================================================ cancel-only
 
 def _store_with_known_order(tmp_path: Path, mode: str) -> None:
@@ -399,6 +529,53 @@ def test_cancel_only_paper_without_database(tmp_path):
     out = Output()
     assert main(['cancel-only', '--config', str(path)], deps=quiet_deps(out, paper_venue_factory=forbid('v'))) == 0
     assert 'бумажных заявок нет' in out.text
+
+
+# ============================================================================ console encoding (Windows)
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_configure_console_makes_ansi_codepage_streams_safe():
+    import io
+
+    from gate_stonk.__main__ import configure_console
+
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding='cp1252', errors='strict')
+    with pytest.raises(UnicodeEncodeError):
+        stream.write('запущен ≤ →')
+    configure_console([stream, object(), None])               # objects without reconfigure are skipped
+    stream.write('gate_stonk запущен ≤ 1%\n')
+    stream.flush()
+    assert stream.encoding == 'cp1252' and stream.errors == 'backslashreplace'
+    assert raw.getvalue().startswith(b'gate_stonk \\u0437')
+
+
+def test_python_m_gate_stonk_survives_redirected_ansi_stdout(tmp_path):
+    """Regression: with stdout redirected on Windows (ANSI code page, errors='strict') the
+    first Russian line raised UnicodeEncodeError and the command exited with code 2."""
+    import subprocess
+    import sys
+
+    path = write_config(tmp_path)
+    env = {k: v for k, v in os.environ.items() if k not in ('PYTHONUTF8', 'PYTHONIOENCODING')}
+    env['PYTHONIOENCODING'] = 'cp1252'                        # what a redirected Windows stdout gets
+    done = subprocess.run([sys.executable, '-m', 'gate_stonk', 'validate', '--config', str(path)], cwd=str(ROOT),
+                          env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    assert done.returncode == 0, done.stderr.decode('ascii', 'replace')
+    assert b'\\u041a\\u043e\\u043d\\u0444' in done.stdout          # 'Конф' escaped, not a crash
+    assert b'UnicodeEncodeError' not in done.stderr
+
+
+@pytest.mark.parametrize('name', ['run_stonk.ps1', 'setup_windows.ps1'])
+def test_windows_scripts_force_utf8_before_python_and_keep_bom(name):
+    raw = (ROOT / name).read_bytes()
+    assert raw.startswith(b'\xef\xbb\xbf')                      # UTF-8 BOM for Windows PowerShell 5.1
+    text = raw[3:].decode('utf-8')
+    utf8 = text.index('$env:PYTHONUTF8 = "1"')
+    first_python = min(i for i in (text.find('& $Python'), text.find('py -3')) if i >= 0)
+    assert utf8 < first_python
 
 
 # ============================================================================ status / report

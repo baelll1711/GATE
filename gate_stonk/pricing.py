@@ -44,10 +44,12 @@ Unsafe codes raised by this module (documented set, see ``UNSAFE_CODES``):
 ``INVALID_MAKER_LIMIT``           maker limit not a positive finite number
 ``INSUFFICIENT_VISIBLE_DEPTH``    ``insufficient_depth: wait`` and visible < skip
 ``SKIP_NOTIONAL_NOT_REACHED``     ``insufficient_depth: wait`` and skipped < skip
+``INVALID_RESTING_PRICE``         ``resting`` entry not a positive finite Decimal
 
 Ladder wait/refusal reasons (``LevelTarget.reason`` when not placeable):
-``MIN_NEW_EDGE_BUFFER``, ``LEVEL_COLLAPSED``, ``POST_ONLY_OR_SELF_CROSS_WAIT``
-(or one of the Unsafe codes above when the level produced no decision).
+``MIN_NEW_EDGE_BUFFER``, ``LEVEL_COLLAPSED``, ``LEVEL_ORDER_WAIT``,
+``POST_ONLY_OR_SELF_CROSS_WAIT`` (or one of the Unsafe codes above when the level
+produced no decision).
 
 Decision reasons: ``FIXED_EDGE``, ``ZERO_SKIP``, ``BOOK_VOLUME``,
 ``INSUFFICIENT_VISIBLE_DEPTH``, ``VOLUME_BELOW_RANGE``, ``VOLUME_ABOVE_RANGE``,
@@ -76,9 +78,10 @@ UNSAFE_CODES = frozenset({
     'INVALID_OUT_OF_RANGE_MODE', 'INVALID_INSUFFICIENT_DEPTH_POLICY', 'INVALID_PROFIT_FLOOR_MODE',
     'INVALID_PROFIT_FLOOR_INPUT', 'PROFIT_FLOOR_ABOVE_RANGE', 'PROFIT_CEILING_BELOW_RANGE',
     'INVALID_OWN_LEVEL', 'INVALID_SKIP_NOTIONAL', 'INVALID_MAKER_LIMIT',
-    'INSUFFICIENT_VISIBLE_DEPTH', 'SKIP_NOTIONAL_NOT_REACHED',
+    'INSUFFICIENT_VISIBLE_DEPTH', 'SKIP_NOTIONAL_NOT_REACHED', 'INVALID_RESTING_PRICE',
 })
-LADDER_WAIT_CODES = frozenset({'MIN_NEW_EDGE_BUFFER', 'LEVEL_COLLAPSED', 'POST_ONLY_OR_SELF_CROSS_WAIT'})
+LADDER_WAIT_CODES = frozenset({'MIN_NEW_EDGE_BUFFER', 'LEVEL_COLLAPSED', 'LEVEL_ORDER_WAIT',
+                               'POST_ONLY_OR_SELF_CROSS_WAIT'})
 
 OUT_OF_RANGE_MODES = ('nearest_index', 'clamp')
 INSUFFICIENT_DEPTH_POLICIES = ('clamp', 'wait')
@@ -448,34 +451,57 @@ def _crosses(side: str, price: Decimal, limit: Decimal) -> bool:
     return price >= limit if side == 'buy' else price <= limit
 
 
+def _validated_resting(resting: Mapping[str, Iterable[Decimal]] | None) -> dict[str, tuple[Decimal, ...]]:
+    result: dict[str, tuple[Decimal, ...]] = {}
+    for level_id, prices in (resting or {}).items():
+        values = tuple(prices)
+        for price in values:
+            if not isinstance(price, Decimal) or not price.is_finite() or price <= 0:
+                raise Unsafe('INVALID_RESTING_PRICE')
+        if values:
+            result[str(level_id)] = values
+    return result
+
+
 def ladder_targets(center: Decimal, book: Book, meta: PairMeta, levels: Sequence[LevelConfig], side: str, *,
                    own_levels: Mapping[Decimal, Decimal] | None = None,
                    floor: Decimal | None = None,
                    ceiling: Decimal | None = None,
                    maker_limit: Decimal | None = None,
                    profit_floor_mode: str = 'hold',
-                   min_new_edge_pct: Decimal) -> tuple[LevelTarget, ...]:
+                   min_new_edge_pct: Decimal,
+                   resting: Mapping[str, Iterable[Decimal]] | None = None) -> tuple[LevelTarget, ...]:
     """Targets for every level of one side, in config order (shallow -> deep).
 
     1. ``select_level_price`` per level; Unsafe -> no decision, reason = code.
     2. ``MIN_NEW_EDGE_BUFFER``: the level's own price is closer than
        ``min_new_edge_pct`` to the center AFTER rounding (decision kept).
     3. Strict monotonicity against the previous level that produced a ladder
-       position (a decision that did not collapse): BUY ``p < p_prev``, SELL
-       ``p > p_prev``. A violating level moves to the tick beyond ``p_prev``
-       (``+LADDER_SHIFT``; evidence recomputed for the moved price). A range level
-       may move only inside its own [lower, upper]; a FIXED_EDGE level may always
-       move deeper (its reported band is widened by the move so a resting order at
-       the shifted price stays inside the band). Otherwise ``LEVEL_COLLAPSED``
-       (not a ladder position: the next level is compared with ``p_prev``).
-    4. ``POST_ONLY_OR_SELF_CROSS_WAIT`` when the final price touches ``maker_limit``.
+       position (a decision that did not collapse) AND against every price a
+       resting own order of a SHALLOWER level may rest at (``resting``: level id ->
+       prices of that level's live same-side order): BUY ``p < min(p_prev, resting)``,
+       SELL ``p > max(p_prev, resting)``. A violating level moves to the tick beyond
+       that bound (``+LADDER_SHIFT``; evidence recomputed for the moved price). A
+       range level may move only inside its own [lower, upper]; a FIXED_EDGE level
+       may always move deeper (its reported band is widened by the move so a
+       resting order at the shifted price stays inside the band). Otherwise
+       ``LEVEL_COLLAPSED`` (not a ladder position: the next level is compared with
+       ``p_prev``).
+    4. ``LEVEL_ORDER_WAIT``: the price would not stay strictly shallower than a
+       resting own order of a DEEPER level (BUY ``p <= max(resting deeper)``, SELL
+       ``p >= min(resting deeper)``); the level waits until that order is repriced
+       (decision kept).
+    5. ``POST_ONLY_OR_SELF_CROSS_WAIT`` when the final price touches ``maker_limit``.
 
     Precedence of not-placeable reasons: Unsafe code > LEVEL_COLLAPSED >
-    MIN_NEW_EDGE_BUFFER > POST_ONLY_OR_SELF_CROSS_WAIT. Placeable targets carry the
-    decision reason.
+    LEVEL_ORDER_WAIT > MIN_NEW_EDGE_BUFFER > POST_ONLY_OR_SELF_CROSS_WAIT. Placeable
+    targets carry the decision reason. A level's own ``resting`` entry is ignored for
+    that level (it is the order being replaced or kept).
     """
     side = _side(side)
     min_new_edge = D(min_new_edge_pct)
+    resting_prices = _validated_resting(resting)
+    level_ids = [level.id for level in levels]
     targets: list[LevelTarget] = []
     reference: Decimal | None = None
     foreign_cache: list = []
@@ -487,7 +513,7 @@ def ladder_targets(center: Decimal, book: Book, meta: PairMeta, levels: Sequence
             foreign_cache.append((foreign, depth))
         return foreign_cache[0]
 
-    for level in levels:
+    for index, level in enumerate(levels):
         if level.side != side:
             raise ValueError(f'level {level.id} belongs to {level.side}, not {side}')
         try:
@@ -498,10 +524,18 @@ def ladder_targets(center: Decimal, book: Book, meta: PairMeta, levels: Sequence
             targets.append(LevelTarget(side, level.id, None, str(exc), False))
             continue
         too_close = edge_pct(side, decision.price, center) < min_new_edge
+        shallower = [p for other in level_ids[:index] if other != level.id for p in resting_prices.get(other, ())]
+        deeper = [p for other in level_ids[index + 1:] if other != level.id for p in resting_prices.get(other, ())]
+        bound = reference
+        if shallower:
+            nearest = min(shallower) if side == 'buy' else max(shallower)
+            if bound is None:
+                bound = nearest
+            else:
+                bound = min(bound, nearest) if side == 'buy' else max(bound, nearest)
         collapsed = False
-        if reference is not None and not (decision.price < reference if side == 'buy'
-                                          else decision.price > reference):
-            moved = price_before(reference, meta) if side == 'buy' else price_after(reference, meta)
+        if bound is not None and not (decision.price < bound if side == 'buy' else decision.price > bound):
+            moved = price_before(bound, meta) if side == 'buy' else price_after(bound, meta)
             allowed = moved > 0 and (_is_fixed(level) or decision.lower <= moved <= decision.upper)
             if allowed:
                 foreign, depth = foreign_for_shift()
@@ -520,8 +554,12 @@ def ladder_targets(center: Decimal, book: Book, meta: PairMeta, levels: Sequence
                 collapsed = True
         if not collapsed:
             reference = decision.price
+        waits = bool(deeper) and not (decision.price > max(deeper) if side == 'buy'
+                                      else decision.price < min(deeper))
         if collapsed:
             reason, placeable = 'LEVEL_COLLAPSED', False
+        elif waits:
+            reason, placeable = 'LEVEL_ORDER_WAIT', False
         elif too_close:
             reason, placeable = 'MIN_NEW_EDGE_BUFFER', False
         elif maker_limit is not None and _crosses(side, decision.price, D(maker_limit)):

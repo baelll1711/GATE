@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / 'config.example.yaml'
 PAIR, BASE, QUOTE = 'STONK_USDT', 'STONK', 'USDT'
 READS = ('open_orders', 'get_order', 'finished_orders', 'my_trades', 'order_trades', 'balances', 'server_time',
-         'account_check')
+         'account_check', 'account_open_orders', 'account_trades')
 
 
 def now_ms() -> int:
@@ -105,6 +105,8 @@ class FakeVenue:
         self.funds = {QUOTE: D(usdt), BASE: D(base)}        # total minus own locks (= available)
         self.orders: dict[str, FakeOrder] = {}
         self.trades: list[FakeTrade] = []
+        self.other_orders: list[VenueOrder] = []      # open orders of OTHER pairs on the account
+        self.other_trades: list[VenueTrade] = []      # trades of OTHER pairs on the account
         self.calls: list[str] = []
         self.place_plan: deque = deque()
         self.batch_plan: deque = deque()
@@ -358,6 +360,14 @@ class FakeVenue:
         self._read('order_trades')
         return [t.trade for t in self._visible() if t.trade.order_id == order_id]
 
+    def account_open_orders(self) -> list[VenueOrder]:
+        self._read('account_open_orders')
+        return list(self.other_orders)
+
+    def account_trades(self, from_ms: int, to_ms: int) -> list[VenueTrade]:
+        self._read('account_trades')
+        return [t for t in self.other_trades if from_ms <= t.create_time_ms <= to_ms]
+
     def balances(self) -> dict[str, Balance]:
         self._read('balances')
         result = {}
@@ -410,6 +420,26 @@ class FakeVenue:
                           create_ms=now, update_ms=now, own=False)
         self.orders[order.order_id] = order
         return order
+
+    def add_other_pair_order(self, pair: str = 'BTC_USDT', side: str = 'buy') -> VenueOrder:
+        now = now_ms()
+        self._next_id += 1
+        order = VenueOrder(order_id=str(self._next_id), text='web', currency_pair=pair, side=side, type='limit',
+                           account='spot', time_in_force='gtc', price=D('50000'), amount=D('0.001'),
+                           left=D('0.001'), filled_amount=ZERO, iceberg=ZERO, status='open', finish_as=None,
+                           create_time_ms=now, update_time_ms=now)
+        self.other_orders.append(order)
+        return order
+
+    def add_other_pair_trade(self, pair: str = 'BTC_USDT', at_ms: int | None = None) -> VenueTrade:
+        self._next_trade += 1
+        self._next_id += 1
+        trade = VenueTrade(trade_id=str(self._next_trade), order_id=str(self._next_id), text='web',
+                           currency_pair=pair, side='buy', role='taker', amount=D('0.001'), price=D('50000'),
+                           fee=ZERO, fee_currency='USDT', point_fee=ZERO, gt_fee=ZERO,
+                           create_time_ms=now_ms() if at_ms is None else at_ms)
+        self.other_trades.append(trade)
+        return trade
 
     def add_foreign_trade(self, side: str = 'buy', price: Any = '0.1360', amount: Any = '10') -> VenueTrade:
         self._next_trade += 1

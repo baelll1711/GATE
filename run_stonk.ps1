@@ -14,6 +14,9 @@ param(
 )
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+# Вывод Python в UTF-8 (иначе русский текст при перенаправлении вывода в файл/конвейер может
+# аварийно завершить процесс в кодовой странице ANSI).
+$env:PYTHONUTF8 = "1"
 $Python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $Python)) { throw "Сначала выполните setup_windows.ps1." }
 $Arguments = @("-m", "gate_stonk", $Command, "--config", $Config)

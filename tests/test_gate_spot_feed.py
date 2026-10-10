@@ -188,6 +188,47 @@ def test_new_snapshot_replaces_the_whole_book_in_the_hub(adapter, fixtures_dir, 
     assert hub.spot_book_error() is None
 
 
+class ServerTimeRest:
+    """Fake HTTP for ``GET /spot/order_book``: each answer is stamped with the (fake)
+    server time of the request (``current``) and a new snapshot id."""
+
+    def __init__(self, clock, payload: dict) -> None:
+        self.clock = clock
+        self.payload = payload
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        return Response(200, dict(self.payload, current=int(self.clock[0] * 1000), id=self.payload['id'] + self.calls))
+
+
+def test_quiet_book_repushed_with_frozen_t_stays_usable_with_the_rest_refresher(adapter, fixtures_dir, clock):
+    """Illiquid pair: Gate may keep re-pushing the unchanged spot.order_book every 100 ms with
+    the book's last-change ``t`` (API_NOTES §2.2, not confirmed). The REST refresher (ticking
+    every 250 ms) keeps the traded book usable, and no stale push deletes the REST snapshot."""
+    http = ServerTimeRest(clock, load(fixtures_dir, 'rest_order_book.json')['response'])
+    hub = FeedHub(Cfg(), adapters=[adapter], start_threads=False, http=http)
+    frozen_t = int(clock[0] * 1000)
+
+    def quiet(frame):
+        frame['result']['t'] = frozen_t
+    start, step = clock[0], 0
+    while clock[0] - start < 10.0:
+        if step % 2 == 0:                       # a 100 ms push of the same snapshot
+            (update,) = adapter.on_text(frame_text(fixtures_dir, 'order_book_update.json', quiet), clock[0],
+                                        int(clock[0] * 1000))
+            hub.publish(update)                 # never rejected (raises Unsafe when it is)
+        if step % 5 == 0:                       # refresher tick
+            hub.refresh_once()
+        assert hub.spot_book_error() is None, (round(clock[0] - start, 2), hub.spot_book_error())
+        clock[0] += 0.05
+        step += 1
+    counters = hub.diagnostics()[GATE_SPOT_KEY]['counters']
+    assert counters['rejected'] == 0 and counters['dropped_out_of_order'] >= 75   # pushes after the 1st poll
+    assert 5 <= http.calls <= 7                 # ~every 1.75 s from 1.75 s on, never faster than 1 s
+    assert hub.diagnostics()[GATE_SPOT_KEY]['source'] == 'rest'
+
+
 def test_zero_size_and_crossed_snapshots_are_rejected_by_the_hub(adapter, fixtures_dir, clock):
     hub = FeedHub(Cfg(), adapters=[adapter], start_threads=False)
     wall = int(clock[0] * 1000)

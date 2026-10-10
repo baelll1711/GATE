@@ -48,7 +48,8 @@ from .pricing import (adverse_boundary, coupled_buy_ceiling, coupled_sell_floor,
 from .ratelimit import ORDER, PRIVATE_READ
 from .reconcile import Reconciler
 from .sizing import iceberg_visible, meets_minimums, requested_size
-from .store import ACTIVE_STATES, FINAL_STATES, Store, utc_day_start_ms, utc_text
+from .store import (ACTIVE_STATES, FINAL_STATES, OWN_LEVEL_GRACE_MS, Store, prior_prices_since, utc_day_start_ms,
+                    utc_text)
 from .types import (SIDES, Balance, Book, CancelRequest, IndexSnapshot, LevelTarget, PairMeta, PlaceRequest,
                     PlaceResult, VenueOrder)
 from .venue import (CANCEL_OUTCOMES, NOT_SENT_LABEL, POST_ONLY_LABEL, BudgetNotSent, base36, is_post_only_rejection,
@@ -70,6 +71,8 @@ RETRY = (5, 10, 20, 40, 60)                     # cancel retry schedule, seconds
 ACTION_RESERVE = 20                              # signed actions kept free under the hourly cap
 INDEX_CACHE_SECONDS = 0.05                       # index recomputed at most every 50 ms
 OBSERVATION_MIN_MS = 150                         # index_obs sampling while orders exist
+IDLE_OBSERVATION_MS = 800                        # ... and at least this often otherwise: the gap between
+                                                 # samples stays under the report's 1 s cap with 0.2 s ticks + jitter
 ACCOUNT_CHECK_SECONDS = 600.0                    # live: account mode / whitelist re-check
 PRUNE_EVERY_SECONDS = 3600.0
 INDEX_RETENTION_MS = 27 * 3_600_000              # keep >= 26 h of index observations
@@ -171,6 +174,8 @@ class Engine(Reconciler):
         self._last_obs_at: int | None = None
         self._guard_seen: dict[str, tuple[float, int]] = {}
         self._text_counter = 0
+        self._sent_mono: dict[str, float] = {}     # text -> monotonic send time (this process only)
+        self._account_scan_countdown = 0           # 0: account-wide scan on the next (first) pass
         self._sync_seq = 0
         self._fills_watermark: int | None = None
         self._last_clock_check: float | None = None
@@ -395,11 +400,15 @@ class Engine(Reconciler):
                      spot_bid=bid, spot_ask=ask)
 
     def sample_index(self) -> None:
-        """Loop tick: sample the index every >= 150 ms while an own order exists and
-        settle due execution marks / markouts. Never stops the loop."""
+        """Loop tick: sample the index every >= 150 ms while an own order exists, and at
+        least every ~0.8 s otherwise (a blocked or idle index still leaves rows, so the
+        report's blocked-time share covers outages after the orders are gone); settle due
+        execution marks / markouts. Never stops the loop."""
         try:
             now_ms = self._now_ms()
-            if (self.store.orders() or self._pending_marks) and now_ms - self._last_obs_ms >= OBSERVATION_MIN_MS:
+            busy = bool(self.store.orders() or self._pending_marks)
+            gap = now_ms - self._last_obs_ms
+            if (busy and gap >= OBSERVATION_MIN_MS) or gap >= IDLE_OBSERVATION_MS:
                 snap = self._index()
                 book, _error = self._spot()
                 self._observe(snap, book)
@@ -536,14 +545,18 @@ class Engine(Reconciler):
                 reasons[o['text']] = stop
         working = [o for o in active if not o['cancel_ack'] and not o['terminal_status']
                    and not o['cancel_reason'] and o['text'] not in reasons]
-        if working:
+        # Rows whose ROUTINE cancel is still unconfirmed stay exposed: the hard guard and a
+        # blocked market escalate them (priority 1 > 0 bypasses the retry backoff once).
+        pending = [o for o in active if not o['cancel_ack'] and not o['terminal_status'] and o['cancel_reason']
+                   and o['text'] not in reasons and _priority(o['cancel_reason']) < 1]
+        if working or pending:
             snap = self._index()
             book, book_error = self._spot()
             if not snap.ok:
-                for o in working:
+                for o in working + pending:
                     reasons[o['text']] = 'BAD_MARKET:' + str(snap.reason)
             elif book_error:
-                for o in working:
+                for o in working + pending:
                     reasons[o['text']] = 'BAD_MARKET:' + book_error
             else:
                 self._observe(snap, book)
@@ -552,6 +565,15 @@ class Engine(Reconciler):
                     if code:
                         reasons[o['text']] = code
                         context[o['text']] = {'center': snap.center, 'origin': origin}
+                for o in pending:
+                    # Hard guard only: the adverse band already caused (or not) the routine cancel.
+                    if any(hard_guard_violation(o['side'], price, snap.center, self._hard_min_edge)
+                           for price in self._prices(o)):
+                        reasons[o['text']] = 'HARD_MIN_EDGE'
+                        context[o['text']] = {'center': snap.center, 'origin': origin}
+                        self._diag('ORDER_PRICE_GUARD', text=o['text'], slot=o['slot'], code='HARD_MIN_EDGE',
+                                   price=o['price'], center=snap.center, origin=origin,
+                                   pending_cancel=o['cancel_reason'])
         for o in active:
             if o['cancel_reason'] and not o['cancel_ack'] and not o['terminal_status']:
                 reasons.setdefault(o['text'], o['cancel_reason'])
@@ -600,7 +622,10 @@ class Engine(Reconciler):
         if self._global_stop() or self.recovering or self._unknown_cancels() or self._renewal_due():
             return
         accounts = '/spot/accounts' if self.cfg.market['account'] == 'spot' else '/unified/accounts'
-        for group, cost in (('/spot/orders', 2), ('/spot/my_trades', 1), (accounts, 1)):
+        planned = [('/spot/orders', 2), ('/spot/my_trades', 1), (accounts, 1)]
+        if self._account_scan_due():
+            planned = [('/spot/orders', 2), ('/spot/my_trades', 2), (accounts, 1), ('/spot/open_orders', 1)]
+        for group, cost in planned:
             bucket = f'{PRIVATE_READ}:{group}'
             try:
                 wait = self.limiter.wait(bucket, cost)
@@ -967,13 +992,15 @@ class Engine(Reconciler):
 
     def _own_levels(self, side: str, snapshot_ms: int) -> dict[Decimal, Decimal]:
         """Live only: price -> own VISIBLE qty (iceberg: min(display, remaining); normal:
-        original qty) incl. orders closed within 2 s before the book snapshot."""
+        original qty) incl. orders closed within 2 s before the book snapshot and, for an
+        amended order, the price it left within those 2 s (the book may still show it)."""
         active = "('" + "','".join(sorted(ACTIVE_STATES)) + "')"
+        since = int(snapshot_ms) - OWN_LEVEL_GRACE_MS
         with self.store.read() as db:
             rows = [dict(r) for r in db.execute(
-                'SELECT text,price,qty,iceberg,filled_qty,amend_state,amend_price FROM orders WHERE side=? AND '
-                f"(state IN {active} OR (state='closed' AND terminal_since_ms>=?))",
-                (side, int(snapshot_ms) - 2000)).fetchall()]
+                'SELECT text,price,qty,iceberg,filled_qty,amend_state,amend_price,prior_prices FROM orders '
+                f"WHERE side=? AND (state IN {active} OR (state='closed' AND terminal_since_ms>=?))",
+                (side, since)).fetchall()]
         result: dict[Decimal, Decimal] = {}
         for row in rows:
             qty = D(row['qty'])
@@ -984,8 +1011,21 @@ class Engine(Reconciler):
             prices = {D(row['price'])}
             if row['amend_state'] in AMEND_OPEN and row['amend_price'] is not None:
                 prices.add(D(row['amend_price']))
+            prices.update(prior_prices_since(row['prior_prices'], since))
             for price in prices:
                 result[price] = result.get(price, ZERO) + visible
+        return result
+
+    def _resting(self, side: str) -> dict[str, list[Decimal]]:
+        """Level id -> every price the live own order of that level may rest at (same side;
+        cancel-pending and terminal-observed rows excluded): ladder monotonicity is also
+        kept against resting orders of other levels, not only among fresh targets."""
+        result: dict[str, list[Decimal]] = {}
+        for o in self.store.orders():
+            if (o['side'] != side or o['cancel_reason'] or o['cancel_ack'] or o['terminal_status']
+                    or self._remaining(o) <= 0):
+                continue
+            result.setdefault(o['level'], []).extend(self._prices(o))
         return result
 
     def _side_targets(self, side: str, snap: IndexSnapshot, book: Book,
@@ -1017,7 +1057,7 @@ class Engine(Reconciler):
         targets = ladder_targets(snap.center, book, self.meta, levels, side, own_levels=own, floor=floor,
                                  ceiling=ceiling, maker_limit=limit,
                                  profit_floor_mode=self.cfg.side('sell').get('profit_floor_mode', 'hold'),
-                                 min_new_edge_pct=self._min_new_edge)
+                                 min_new_edge_pct=self._min_new_edge, resting=self._resting(side))
         result = {target.level: target for target in targets}
         for target in targets:
             self.targets[f'{side}:{target.level}'] = target
@@ -1390,16 +1430,53 @@ class Engine(Reconciler):
             raise
         if not reserved:
             return
-        unknown = False
         requests = [req for _intent, req in reserved]
-        if len(requests) == 1 or not self.cfg.execution.get('use_batch', True):
-            for req in requests:
-                unknown |= self._place_one(req)
-        else:
-            for start in range(0, len(requests), BATCH_CREATE_MAX):
-                unknown |= self._place_chunk(requests[start:start + BATCH_CREATE_MAX])
-        if unknown:
-            raise UnknownCreate('UNKNOWN_CREATE_RESULT')
+        batch = len(requests) > 1 and bool(self.cfg.execution.get('use_batch', True))
+        groups = ([requests[start:start + BATCH_CREATE_MAX] for start in range(0, len(requests), BATCH_CREATE_MAX)]
+                  if batch else [[req] for req in requests])
+        for index, group in enumerate(groups):
+            # Every request is signed only now: re-check the DMS margin and the order
+            # rate before EACH send (a slow earlier request may have used them up).
+            blocked = self._send_blocked()
+            if blocked is not None:
+                self._close_unsent([req for rest in groups[index:] for req in rest], blocked)
+                return
+            try:
+                self._mark_sent(group)
+            except Exception:
+                # Nothing of this group or later ones was sent: release them, then stop.
+                self._safely(self._close_unsent, [req for rest in groups[index:] for req in rest],
+                             NotSent('SEND_STAMP_FAILED'))
+                raise
+            unknown = self._place_chunk(group) if batch else self._place_one(group[0])
+            if unknown:
+                # Stop at the first unknown result (reference): the rows not sent yet
+                # provably cannot exist and are released at once.
+                self._close_unsent([req for rest in groups[index + 1:] for req in rest],
+                                   NotSent('UNKNOWN_CREATE_STOP'))
+                raise UnknownCreate('UNKNOWN_CREATE_RESULT')
+
+    def _send_blocked(self) -> BaseException | None:
+        """Why the next create request must not be sent now (None: it may)."""
+        if self.dms_deadline_ms - self._now_ms() <= (self._q() + self._e() + 1) * 1000:
+            return NotSent('DMS_TOO_CLOSE_FOR_CREATE')
+        if not self._order_rate_room(1):
+            return BudgetWait(0.0, ORDER)
+        return None
+
+    def _close_unsent(self, requests: Sequence[PlaceRequest], exc: BaseException) -> None:
+        """Release reservations whose request was never sent (NotSent path)."""
+        for req in requests:
+            self._create_not_sent(req, exc)
+
+    def _mark_sent(self, requests: Sequence[PlaceRequest]) -> None:
+        """Persist (and remember on the monotonic clock) the send time of the rows carried
+        by ONE request, immediately before it is signed and sent: the unknown-create
+        expiry window starts here, not at the reservation."""
+        now, mono = self._now_ms(), time.monotonic()
+        self.store.mark_sent([req.text for req in requests], now)
+        for req in requests:
+            self._sent_mono[req.text] = mono
 
     def _reserve_intents(self, intents: list[dict], snap: IndexSnapshot, book: Book | None, book_error: str | None,
                          reserved: list[tuple[dict, PlaceRequest]]) -> None:
@@ -1524,6 +1601,7 @@ class Engine(Reconciler):
         row = self.store.order(req.text)
         slot = row['slot']
         self.store.close_order(req.text, 'rejected', self._now_ms())
+        self._sent_mono.pop(req.text, None)
         self.counters['rejects'] += 1
         label = label or 'REJECTED'
         post_only = label == POST_ONLY_LABEL
@@ -1552,6 +1630,7 @@ class Engine(Reconciler):
         row = self.store.order(req.text)
         slot = row['slot']
         self.store.close_order(req.text, 'rejected', self._now_ms())
+        self._sent_mono.pop(req.text, None)
         self.counters['not_sent'] += 1
         if isinstance(exc, (BudgetNotSent, BudgetWait)):
             # The local limiter refused: no reject is counted; the slot waits for room.

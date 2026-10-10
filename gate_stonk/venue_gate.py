@@ -745,6 +745,89 @@ class GateVenue:
                                  'outside_window': len(seen) - len(inside), 'slices': slices}
         return inside
 
+    # ------------------------------------------------------------------ account-wide (other pairs)
+    def account_open_orders(self) -> list[VenueOrder]:
+        """Open orders of OTHER pairs on the account (foreign-activity check; never managed).
+
+        GET /spot/open_orders (all pairs, ``account`` as configured). Gate pages INSIDE each
+        pair (``limit`` <= 100): the reply is ``[{currency_pair, total, orders: [...]}]`` and
+        pages are read until no pair returns a full page. The bot's own pair is skipped (the
+        pair read covers it); orders missing ``currency_pair`` inherit their group's pair.
+        """
+        limit = self.settings.orders_page_limit
+        found: dict[str, VenueOrder] = {}
+        for page in range(1, self.settings.max_pages + 1):
+            reply = self._read('/spot/open_orders', [('page', page), ('limit', limit), ('account', self.account)])
+            if not isinstance(reply, list):
+                raise ReadError('INVALID_ACCOUNT_OPEN_ORDERS')
+            more = False
+            for group in reply:
+                if not isinstance(group, Mapping) or not isinstance(group.get('orders'), list):
+                    raise ReadError('INVALID_ACCOUNT_OPEN_ORDERS')
+                pair = group.get('currency_pair')
+                if not isinstance(pair, str) or not _PAIR_RE.fullmatch(pair):
+                    raise ReadError('INVALID_ACCOUNT_OPEN_ORDERS')
+                rows = group['orders']
+                if len(rows) >= limit:
+                    more = True
+                if pair == self.pair:
+                    continue
+                for raw in rows:
+                    if isinstance(raw, Mapping) and raw.get('currency_pair') in (None, ''):
+                        raw = dict(raw, currency_pair=pair)
+                    try:
+                        order = parse_order(raw)
+                    except Unsafe:
+                        raise
+                    except (ValueError, TypeError, ArithmeticError):
+                        raise ReadError('INVALID_ACCOUNT_OPEN_ORDER') from None
+                    if order.currency_pair != pair:
+                        raise Unsafe('UNEXPECTED_ORDER_PAIR')
+                    if order.status != 'open':
+                        raise ReadError('INVALID_OPEN_ORDER_STATUS')
+                    found[order.order_id] = order
+            if not more:
+                return sorted(found.values(), key=lambda o: (o.currency_pair, int(o.order_id)))
+        raise Unsafe('ACCOUNT_OPEN_ORDERS_TOO_MANY_PAGES')
+
+    def account_trades(self, from_ms: int, to_ms: int) -> list[VenueTrade]:
+        """Trades of OTHER pairs on the account with ``from_ms <= create_time_ms <= to_ms``.
+
+        GET /spot/my_trades WITHOUT currency_pair (all pairs), same seconds window, slicing
+        and complete paging as :meth:`my_trades`; own-pair rows are dropped (the pair read
+        covers them); dedup by (pair, trade id); sorted by (create_time_ms, id).
+        """
+        try:
+            from_s, to_s = self._window(from_ms, to_ms)
+        except ValueError as exc:
+            raise not_sent(exc) from None
+        seen: dict[tuple[str, str], VenueTrade] = {}
+        start = from_s
+        while True:
+            end = min(to_s, start + self.settings.trade_window_seconds)
+            rows = self._paged('/spot/my_trades', [('from', start), ('to', end)],
+                               limit=self.settings.trades_page_limit, too_many='ACCOUNT_FILL_HISTORY_TOO_LARGE',
+                               invalid='INVALID_FILL_HISTORY')
+            for raw in rows:
+                try:
+                    trade = parse_trade(raw)
+                except (ValueError, TypeError, ArithmeticError):
+                    raise ReadError('INVALID_TRADE_ROW') from None
+                if trade.currency_pair == self.pair:
+                    continue
+                key = (trade.currency_pair, trade.trade_id)
+                previous = seen.get(key)
+                if previous is None:
+                    seen[key] = trade
+                elif _trade_identity(previous) != _trade_identity(trade):
+                    raise Unsafe('CONFLICTING_TRADE_ROWS')
+            if end >= to_s:
+                break
+            start = end
+        inside = [t for t in seen.values() if from_ms <= t.create_time_ms <= to_ms]
+        inside.sort(key=trade_sort_key)
+        return inside
+
     def order_trades(self, order_id: str) -> list[VenueTrade]:
         """Extra (not in the protocol): all trades of one order (GET /spot/my_trades?order_id, last 7 days)."""
         try:

@@ -33,8 +33,10 @@ Checks (each reports Russian lines; a failing REQUIRED check makes the exit code
   ``market.account``, pair whitelist, IP whitelist; required), ``open_orders``,
   ``key_permissions`` (Gate has no permission endpoint; ``--probe-write`` sends the harmless
   signed ``countdown_cancel_all {timeout: 0}`` — it DISARMS the pair countdown — and only
-  when the pair has no open orders), ``balances`` (required), ``fees`` (GT deduction
-  warning). Without keys these checks are skipped with a message.
+  when the pair has no open orders; ``cmd_doctor`` runs it under the bot's process locks
+  (``state_dir`` + per-key/pair), so it is refused while a bot runs on the same state_dir
+  or key/pair and no bot can start during it), ``balances`` (required), ``fees`` (GT
+  deduction warning). Without keys these checks are skipped with a message.
 
 Nothing here places or cancels an order or sends Telegram. Every network dependency is
 injectable (``http`` session, ``hub_factory``, ``venue_factory``, ``sleep``).

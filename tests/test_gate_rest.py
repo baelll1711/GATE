@@ -340,23 +340,55 @@ def test_from_config_reads_market_app_and_secrets():
     assert client.timeout == 4.0 and client.request_expiry_ms == 12_000 and client.has_keys
 
 
-def test_local_clock_moving_backwards_is_not_sent(clock):
+def test_local_clock_moving_backwards_refuses_only_order_creates_and_amends(clock):
+    """Gate has no nonce: a backwards wall-clock step refuses (NotSent, safe) only the
+    non-emergency writes that create or amend orders. Emergency cancels, the DMS
+    countdown and reads are still sent (diagnostic only), so a protective cancel is not
+    delayed until the clock catches up (review finding: guard ported from the HL nonce rule)."""
     client, session = make_client()
-    session.queue(ok({}), ok({}), ok({}))
+    session.queue(ok({}))
     clock[0] = 1800000000.500
     client.private('POST', '/spot/orders', body={})
     clock[0] = 1800000000.499
-    with pytest.raises(NotSentUnsafe, match='LOCAL_CLOCK_MOVED_BACKWARDS') as info:
-        client.private('POST', '/spot/cancel_batch_orders', body=[])
-    assert isinstance(info.value, Unsafe) and isinstance(info.value, NotSent)
-    with pytest.raises(NotSentUnsafe):
-        client.private('GET', '/spot/accounts')
+    for method, path, body in (('POST', '/spot/orders', {}), ('POST', '/spot/batch_orders', []),
+                               ('PATCH', '/spot/orders/123', {}), ('POST', '/spot/amend_batch_orders', [])):
+        with pytest.raises(NotSentUnsafe, match='LOCAL_CLOCK_MOVED_BACKWARDS') as info:
+            client.private(method, path, body=body)
+        assert isinstance(info.value, Unsafe) and isinstance(info.value, NotSent)
     assert len(session.calls) == 1
+    session.queue(ok([]), ok({'triggerTime': '0'}), ok({}), ok({}), ok([]))
+    client.private('POST', '/spot/cancel_batch_orders', body=[])        # emergency cancel: sent
+    client.private('POST', '/spot/countdown_cancel_all', body={'timeout': 45})   # DMS renewal: sent
+    client.private('DELETE', '/spot/orders/123', params={'currency_pair': 'STONK_USDT'})
+    client.private('GET', '/spot/accounts')                              # signed read: sent
+    client.private('GET', '/spot/orders', params={'currency_pair': 'STONK_USDT', 'status': 'open'})
+    assert [c['path'] for c in session.calls[1:]] == [
+        '/api/v4/spot/cancel_batch_orders', '/api/v4/spot/countdown_cancel_all', '/api/v4/spot/orders/123',
+        '/api/v4/spot/accounts', '/api/v4/spot/orders']
+    assert all(c['headers']['Timestamp'] == '1800000000' for c in session.calls[1:])
+    diag = client.diagnostics()['clock_backwards']
+    assert diag['count'] == 5 and diag['last']['behind_ms'] == 1
+    assert client.last_signed_ms == 1800000000500                       # never moves backwards
+    with pytest.raises(NotSentUnsafe):                                   # creates stay refused meanwhile
+        client.private('POST', '/spot/orders', body={})
+    session.queue(ok({}), ok({}))
     client.public('GET', '/spot/time')           # unsigned: no clock guard
     clock[0] = 1800000000.500                    # same millisecond again is fine
-    client.private('GET', '/spot/accounts')
-    assert len(session.calls) == 3
+    client.private('POST', '/spot/orders', body={})
+    assert len(session.calls) == 8
     assert client.last_signed_ms == 1800000000500
+    assert client.diagnostics()['clock_backwards']['count'] == 5
+    json.dumps(client.diagnostics())
+
+
+def test_clock_guard_disabled_sends_creates(clock):
+    client, session = make_client(clock_guard=False)
+    session.queue(ok({}), ok({}))
+    clock[0] = 1800000000.500
+    client.private('POST', '/spot/orders', body={})
+    clock[0] = 1800000000.000
+    client.private('POST', '/spot/orders', body={})
+    assert len(session.calls) == 2 and client.diagnostics()['clock_backwards']['count'] == 1
 
 
 # ----------------------------------------------------------------------------- limiter + checkpoint integration

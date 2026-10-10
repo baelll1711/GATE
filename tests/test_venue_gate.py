@@ -596,8 +596,10 @@ def test_cancel_many_is_emergency_and_input_checks(clock):
     assert [item['id'] for item in session.calls[-1]['body']] == ['10']
     venue.client._last_signed_ms = NOW_MS + 1_000                     # local clock went backwards
     calls = len(session.calls)
-    assert venue.cancel_many(reqs) == {r.text: 'unknown' for r in reqs}
-    assert len(session.calls) == calls
+    session.queue([{'id': '10', 'succeeded': True}, {'id': '11', 'succeeded': True}])
+    # Gate has no nonce: a protective cancel is still sent (gate_rest backwards-clock fix).
+    assert venue.cancel_many(reqs) == {r.text: 'sent' for r in reqs}
+    assert len(session.calls) == calls + 1
 
 
 def test_cancel_all_pair(clock):
@@ -957,6 +959,70 @@ def test_my_trades_long_window_is_sliced(clock):
     assert venue.last_trades_read['slices'] == 2
     with pytest.raises(NotSent):
         venue.my_trades(5, 1)
+
+
+# ----------------------------------------------------------------------------- account-wide (other pairs)
+
+def _group(pair, rows):
+    return {'currency_pair': pair, 'total': len(rows), 'orders': rows}
+
+
+def test_account_open_orders_returns_other_pairs_only_and_pages_per_pair(clock):
+    venue, session = make_venue()
+    checkpoints = []
+    venue.before_read = lambda: checkpoints.append(1)
+    btc_page1 = [order_row(id=str(3000 + i), currency_pair='BTC_USDT', text='web') for i in range(100)]
+    eth = [order_row(id='4000', text='apiv4', time_in_force='gtc')]          # no currency_pair: group's pair
+    del eth[0]['currency_pair']
+    own = _rows(1000, 2)
+    session.queue([_group('STONK_USDT', own), _group('BTC_USDT', btc_page1), _group('ETH_USDT', eth)],
+                  [_group('BTC_USDT', [order_row(id='3100', currency_pair='BTC_USDT')])])
+    orders = venue.account_open_orders()
+    assert len(orders) == 102 and {o.currency_pair for o in orders} == {'BTC_USDT', 'ETH_USDT'}
+    assert next(o for o in orders if o.order_id == '4000').currency_pair == 'ETH_USDT'
+    assert len(checkpoints) == 2
+    for page, call in enumerate(session.calls, start=1):
+        assert call['method'] == 'GET' and call['path'] == '/api/v4/spot/open_orders'
+        assert call['params'] == {'page': str(page), 'limit': '100', 'account': 'spot'}
+    session.queue([_group('STONK_USDT', own)])
+    assert venue.account_open_orders() == []
+
+
+def test_account_open_orders_malformed_and_page_guard(clock):
+    venue, session = make_venue()
+    for reply, error in (({'not': 'a list'}, ReadError), ([{'currency_pair': 'BTC_USDT'}], ReadError),
+                         ([_group('btc', [])], ReadError),
+                         ([_group('BTC_USDT', [order_row(currency_pair='BTC_USDT', amount='abc')])], ReadError),
+                         ([_group('BTC_USDT', [order_row(currency_pair='ETH_USDT')])], Unsafe)):
+        session.queue(reply)
+        with pytest.raises(error):
+            venue.account_open_orders()
+    venue, session = make_venue(max_pages=1)
+    session.queue([_group('BTC_USDT', [order_row(id=str(i), currency_pair='BTC_USDT') for i in range(1, 101)])])
+    with pytest.raises(Unsafe, match='ACCOUNT_OPEN_ORDERS_TOO_MANY_PAGES'):
+        venue.account_open_orders()
+
+
+def test_account_trades_without_pair_filter_returns_other_pairs(clock):
+    venue, session = make_venue()
+    base = 1800000010000
+    rows = [trade_row(1, base, currency_pair='BTC_USDT', text='web', order_id='77'),
+            trade_row(2, base + 10),                                         # own pair: covered by my_trades
+            trade_row(3, base - 5000, currency_pair='ETH_USDT', order_id='78'),   # outside the window
+            trade_row(1, base, currency_pair='BTC_USDT', text='web', order_id='77')]   # repeated row
+    session.queue(rows)
+    trades = venue.account_trades(base, base + 10_000)
+    assert [(t.currency_pair, t.trade_id) for t in trades] == [('BTC_USDT', '1')]
+    [call] = session.calls
+    assert call['path'] == '/api/v4/spot/my_trades'
+    assert call['params'] == {'from': str(base // 1000 - 1), 'to': str((base + 10_000) // 1000 + 1), 'page': '1',
+                              'limit': '1000'}
+    session.queue([trade_row(1, base, currency_pair='BTC_USDT'), trade_row(1, base, currency_pair='BTC_USDT',
+                                                                           amount='11')])
+    with pytest.raises(Unsafe, match='CONFLICTING_TRADE_ROWS'):
+        venue.account_trades(base, base + 10_000)
+    with pytest.raises(NotSent):
+        venue.account_trades(5, 1)
 
 
 def test_order_trades(clock):

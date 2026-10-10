@@ -18,24 +18,43 @@ Port of the reference ``Feeds`` ingestion/threading model (12-chagpt
   strictly increasing ``seq``);
 * ``QuoteHealth`` (bounded fault logs, bounded stale-stream reconnects);
 * REST refresher: for keys with a ``rest_refresh_after_seconds`` threshold, when the
-  newest book/ticker receipt age exceeds it, one ``adapter.rest_snapshot`` at most
-  once per ``max(1.0, adapter.rest_min_interval)``, published through the same path.
+  freshest stored book/ticker is older than it, one ``adapter.rest_snapshot`` at most
+  once per ``max(1.0, adapter.rest_min_interval, venue floor)``, published through the
+  same path. "Older" is ``max(receipt age, event age)`` (deliberate addition: a stream
+  that keeps re-pushing a quiet snapshot with a frozen event time has fresh receipts
+  but an ageing event time, so the refresher fetches a REST snapshot BEFORE the pushes
+  fail the event-age check, instead of after the key was already invalidated).
+  Each key is polled by its own job (a daemon thread per poll when threads run, inline
+  without threads, or an injected ``rest_executor(key, job)``) with at most one request
+  in flight per key, so a venue that hangs until the HTTP timeout never delays the
+  traded book or FX. A poll that raises (transport, HTTP status, bad payload) backs the
+  key off exponentially: the next poll waits ``2 x min_interval``, then doubles, capped
+  at ``REST_BACKOFF_MAX_SECONDS`` (never below the venue floor); a successful request
+  resets it.
 
 Cross-transport ordering (deliberate addition): WS and REST snapshots of one key
 are separate streams. Update ids are compared only within one transport, and a
 snapshot OLDER (event time) than the stored one from the other transport is
-dropped without invalidating the newer data. Within one transport any regression
-invalidates the key (reference behaviour).
+dropped without invalidating the newer data. That rule is applied BEFORE the
+freshness reject: a frame that fails only the event/receipt age check and is not
+newer than the other transport's stored snapshot is counted ``dropped_out_of_order``
+and never wipes that snapshot (otherwise a delayed or quiet WS push would delete a
+fresh REST book). Structural failures, future-dated events (clock skew), stale data
+from the same transport and stale data newer than the stored snapshot still
+invalidate the key. Within one transport any regression invalidates the key
+(reference behaviour). Readers re-check freshness, so a kept snapshot that ages out
+is still refused at use time.
 """
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import math
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -61,7 +80,18 @@ MIN_REST_INTERVAL_SECONDS = 1.0
 # Per-venue REST poll floors (DESIGN §16: Lighter 2 s), applied even when an adapter
 # does not declare ``rest_min_interval`` itself.
 VENUE_REST_MIN_INTERVAL_SECONDS = {'lighter': 2.0}
+# Failed REST polls: 2 x min_interval, doubling, capped here (never below the venue floor).
+REST_BACKOFF_MAX_SECONDS = 10.0
 TICKER_PRICE_KINDS = ('mark', 'last')
+# Ingestion codes that only mean "too old": the cross-transport rule may drop such a
+# frame instead of invalidating newer data from the other transport.
+FRESHNESS_CODES = frozenset({'STALE_QUOTE', 'STALE_EVENT_OR_CLOCK_SKEW'})
+
+RestExecutor = Callable[[str, Callable[[], None]], Any]
+
+
+def _run_inline(key: str, job: Callable[[], None]) -> None:
+    job()
 
 
 @dataclass(frozen=True)
@@ -99,12 +129,17 @@ def effective_max_age(source: Any) -> float:
 
 
 class FeedHub:
-    """Market data hub. ``start()`` launches workers only when ``start_threads``."""
+    """Market data hub. ``start()`` launches workers only when ``start_threads``.
+
+    ``rest_executor(key, job)`` runs one REST poll job (tests inject a deferred one);
+    by default each poll gets its own daemon thread when ``start_threads`` and runs
+    inline otherwise.
+    """
 
     TRADE_HISTORY = TRADE_HISTORY
 
     def __init__(self, cfg: Any, adapters: Sequence[Any] | None = None, start_threads: bool = True, *,
-                 connect: Any = None, http: Any = None) -> None:
+                 connect: Any = None, http: Any = None, rest_executor: RestExecutor | None = None) -> None:
         self.cfg = cfg
         settings = cfg.index_settings()
         self.settings = settings
@@ -114,7 +149,9 @@ class FeedHub:
         self.start_threads = bool(start_threads)
         self._connect = connect
         self._http = http
-        self._own_http: Any = None
+        self._own_http: dict[str, Any] = {}        # per-key HTTP sessions (polls run concurrently)
+        self._rest_executor: RestExecutor = (rest_executor if rest_executor is not None
+                                             else self._spawn_rest if self.start_threads else _run_inline)
         market = cfg.market
         self.currency_pair = str(market['currency_pair'])
         self.needs_fx = fx_needed(settings.sources)
@@ -214,10 +251,11 @@ class FeedHub:
         refresher, self._refresher = self._refresher, None
         if refresher is not None and refresher is not threading.current_thread():
             refresher.join(STOP_JOIN_SECONDS)
-        own, self._own_http = self._own_http, None
-        if own is not None:
+        with self.lock:
+            own, self._own_http = list(self._own_http.values()), {}
+        for session in own:
             try:
-                own.close()
+                session.close()      # a poll still in flight ends by its own HTTP timeout
             except Exception:
                 pass
         with self.lock:
@@ -407,38 +445,72 @@ class FeedHub:
 
     # ============================================================ REST refresher
     def refresh_once(self, http: Any = None) -> list[str]:
-        """One refresher pass (the thread calls it every 0.25 s). Returns polled keys."""
+        """One refresher pass (the thread calls it every 0.25 s). Returns the keys whose
+        poll was started; each poll runs through ``rest_executor`` (per-key job), so one
+        slow venue never delays another key."""
         polled: list[str] = []
         for key, adapter, after, min_interval in self._refresh_plan():
+            now, wall_ms = time.monotonic(), int(time.time() * 1000)
             with self.lock:
                 if self._stopped:
                     break
-                newest = self._newest_receipt(key)
                 state = self._rest.setdefault(key, {'after_seconds': after, 'min_interval_seconds': min_interval,
                                                     'polls': 0, 'failures': 0, 'last_poll_monotonic': None,
-                                                    'last_error': None})
-            now = time.monotonic()
-            if newest is not None and now - newest <= after:
-                continue
-            last = state['last_poll_monotonic']
-            if last is not None and now - last < min_interval:
-                continue
-            with self.lock:
+                                                    'last_error': None, 'in_flight': False,
+                                                    'consecutive_failures': 0, 'backoff_seconds': 0.0,
+                                                    'next_poll_monotonic': None})
+                if state['in_flight']:
+                    continue      # at most one request per key; a hung venue only blocks itself
+                age = self._refresh_age(key, now, wall_ms)
+                if age is not None and age <= after:
+                    continue
+                last = state['last_poll_monotonic']
+                if last is not None and now - last < min_interval:
+                    continue      # venue floor between request starts (Lighter 2 s)
+                not_before = state['next_poll_monotonic']
+                if not_before is not None and now < not_before:
+                    continue      # backing off after a failed poll
+                state['in_flight'] = True
                 state['last_poll_monotonic'] = now
                 state['polls'] += 1
             polled.append(key)
-            client = http if http is not None else self._http_client()
             try:
-                updates = adapter.rest_snapshot(client, self.timeout, now, int(time.time() * 1000))
+                client = http if http is not None else self._http_client(key)
+                job = functools.partial(self._poll_rest, key, adapter, client, state, min_interval)
+                self._rest_executor(key, job)
+            except Exception as exc:     # the job never started (e.g. thread start failed)
+                reason = safe_reason(exc)
+                with self.lock:
+                    state['in_flight'] = False
+                    state['failures'] += 1
+                    state['last_error'] = reason
+                self._warn('rest:' + key, f'{key} REST refresh not started: {reason}')
+        return polled
+
+    def _poll_rest(self, key: str, adapter: Any, client: Any, state: dict[str, Any], min_interval: float) -> None:
+        """One REST poll of ``key`` (runs in its own job); never raises."""
+        try:
+            try:
+                updates = list(adapter.rest_snapshot(client, self.timeout, time.monotonic(),
+                                                     int(time.time() * 1000)) or ())
             except Exception as exc:
                 reason = safe_reason(exc)
                 with self.lock:
                     state['failures'] += 1
+                    state['consecutive_failures'] += 1
                     state['last_error'] = reason
+                    backoff = min(max(REST_BACKOFF_MAX_SECONDS, min_interval),
+                                  2 * max(min_interval, state['backoff_seconds']))
+                    state['backoff_seconds'] = backoff
+                    state['next_poll_monotonic'] = time.monotonic() + backoff
                 self._warn('rest:' + key, f'{key} REST refresh failed: {reason}')
-                continue
+                return
+            with self.lock:
+                state['consecutive_failures'] = 0
+                state['backoff_seconds'] = 0.0
+                state['next_poll_monotonic'] = None
             error = None
-            for update in updates or ():
+            for update in updates:
                 if not isinstance(update, Update) or update.key != key:
                     error = 'INVALID_ADAPTER_OUTPUT'
                     continue
@@ -450,7 +522,19 @@ class FeedHub:
                 state['last_error'] = error
                 if error is not None:
                     state['failures'] += 1
-        return polled
+        except Exception as exc:
+            reason = safe_reason(exc)
+            with self.lock:
+                state['failures'] += 1
+                state['last_error'] = reason
+            self._warn('rest:' + key, f'{key} REST refresh failed: {reason}')
+        finally:
+            with self.lock:
+                state['in_flight'] = False
+
+    def _spawn_rest(self, key: str, job: Callable[[], None]) -> None:
+        """Default executor with threads: one daemon thread per poll (at most one per key)."""
+        threading.Thread(target=job, name=f'feed-rest-{key}', daemon=True).start()
 
     def _refresh_plan(self) -> list[tuple[str, Any, float, float]]:
         plan = []
@@ -479,17 +563,22 @@ class FeedHub:
             except Exception as exc:
                 self._warn('refresher', f'REST refresher pass failed: {type(exc).__name__}')
 
-    def _http_client(self) -> Any:
+    def _http_client(self, key: str) -> Any:
         if self._http is not None:
             return self._http
-        if self._own_http is None:
-            import requests
-            self._own_http = requests.Session()
-        return self._own_http
+        import requests
+        with self.lock:
+            session = self._own_http.get(key)
+            if session is None:
+                session = self._own_http[key] = requests.Session()
+            return session
 
-    def _newest_receipt(self, key: str) -> float | None:
-        times = [item.received for item in (self._books.get(key), self._tickers.get(key)) if item is not None]
-        return max(times) if times else None
+    def _refresh_age(self, key: str, now: float, wall_ms: int) -> float | None:
+        """Under the lock: age (s) of the freshest stored book/ticker of ``key``, where
+        an item's age is ``max(receipt age, event age)``; None when nothing is stored."""
+        ages = [max(now - item.received, (wall_ms - item.event_ms) / 1000)
+                for item in (self._books.get(key), self._tickers.get(key)) if item is not None]
+        return min(ages) if ages else None
 
     # ================================================================ ingestion
     def _publish_book(self, spec: KeySpec, book: Any, transport: str) -> None:
@@ -497,6 +586,8 @@ class FeedHub:
         try:
             self._validate_book(book, wall_ms, spec.max_age)
         except Unsafe as exc:
+            if self._superseded_stale(spec.key, 'book', book, transport, str(exc), wall_ms):
+                return
             self._reject(spec, str(exc), wall_ms, getattr(book, 'event_ms', None))
             raise
         except (TypeError, ValueError, AttributeError, ArithmeticError) as exc:
@@ -538,6 +629,8 @@ class FeedHub:
         try:
             self._validate_ticker(ticker, wall_ms, spec.max_age)
         except Unsafe as exc:
+            if self._superseded_stale(spec.key, 'ticker', ticker, transport, str(exc), wall_ms):
+                return
             self._reject(spec, str(exc), wall_ms, getattr(ticker, 'event_ms', None))
             raise
         except (TypeError, ValueError, AttributeError, ArithmeticError) as exc:
@@ -680,6 +773,30 @@ class FeedHub:
         except Unsafe as exc:
             return str(exc)
         return None
+
+    def _superseded_stale(self, key: str, kind: str, item: Any, transport: str, code: str, wall_ms: int) -> bool:
+        """Cross-transport rule applied before the freshness reject.
+
+        True (frame counted ``dropped_out_of_order``, nothing invalidated) only when
+        the frame failed nothing but the age check (every structural check runs
+        first), its event time is in the past (not future clock skew), and the stored
+        snapshot of the same kind came from the OTHER transport with an event time
+        not older than the frame. Otherwise the caller rejects as before.
+        """
+        if code not in FRESHNESS_CODES:
+            return False
+        event_ms = getattr(item, 'event_ms', None)
+        if not _is_count(event_ms) or event_ms > wall_ms:
+            return False
+        with self.lock:
+            if self._stopped:
+                return False
+            stored = (self._books if kind == 'book' else self._tickers).get(key)
+            origin = self._origin.get((key, kind))
+            if stored is None or origin is None or origin == transport or event_ms > stored.event_ms:
+                return False
+            self._counters[key]['dropped_out_of_order'] += 1
+        return True
 
     def _drop(self, key: str, reason: str) -> None:
         """Under the lock: forget data and sequence state of ``key``; store ``reason``."""

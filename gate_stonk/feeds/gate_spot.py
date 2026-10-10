@@ -20,6 +20,17 @@ Wire facts (notes/api_gate_ws_futures.md §1-2, notes/api_gate_rest.md, Gate SDK
 
 Data problems become ``Update(kind='error')`` for this key only; only socket-level
 conditions (subscription rejected, non-JSON frame) raise ``Unsafe`` (reconnect).
+
+Freshness of the traded book (deliberate choice): ``event_ms`` = ``t``, the book's own
+time, for both the event-age check and regression/cross-transport ordering. The
+envelope ``time_ms`` (push time) is NOT used for freshness: it proves only that a push
+is recent, not that the book content is (a publisher stuck on an old book would look
+fresh), ``Book`` carries a single event time that ordering and the engine's own-order
+window also use, and whether Gate re-pushes an unchanged book at all is unconfirmed
+(API_NOTES §2.2, stage-1 check §9.1). A quiet book stays usable through the hub's REST
+refresher instead: once the stored book's event age passes ``rest_refresh_after_seconds``
+(1.5 s, even while pushes keep arriving) it fetches ``/spot/order_book`` (``current`` =
+server time), and pushes older than that snapshot are dropped without invalidating it.
 """
 from __future__ import annotations
 

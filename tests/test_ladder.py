@@ -34,11 +34,11 @@ def rg(level_id: str, side: str, lo, hi, skip=0, **kw) -> LevelConfig:
 
 
 def ladder(center, snap, levels, side, *, precision=3, own_levels=None, own_opposite=(), floor=None,
-           ceiling=None, min_new_edge='1', profit_floor_mode='hold'):
+           ceiling=None, min_new_edge='1', profit_floor_mode='hold', resting=None):
     limit = maker_limit(side, snap, [D(p) for p in own_opposite])
     return ladder_targets(D(center), snap, meta(precision), levels, side, own_levels=own_levels, floor=floor,
                           ceiling=ceiling, maker_limit=limit, profit_floor_mode=profit_floor_mode,
-                          min_new_edge_pct=D(min_new_edge))
+                          min_new_edge_pct=D(min_new_edge), resting=resting)
 
 
 def summary(targets):
@@ -185,6 +185,51 @@ def test_unsafe_level_has_no_decision_and_is_skipped_as_reference():
         ('b2', None, 'INSUFFICIENT_VISIBLE_DEPTH', False),
         ('b3', D(97), 'FIXED_EDGE', True),
     ]
+
+
+# ============================================================================ monotonicity against resting orders
+def test_deeper_level_shifts_below_a_shallower_resting_order():
+    # Index 0.1380: fresh b2 (2 %) = 0.1352, but b1 still rests deeper-tolerated at 0.1345.
+    levels = [ex('b1', 'buy', 1), ex('b2', 'buy', 2)]
+    targets = ladder('0.1380', WIDE, levels, 'buy', precision=4, resting={'b1': [D('0.1345')]})
+    assert summary(targets) == [('b1', D('0.1366'), 'FIXED_EDGE', True),
+                                ('b2', D('0.1344'), 'FIXED_EDGE+LADDER_SHIFT', True)]
+    assert targets[1].decision.lower == D('0.1344')                 # band widened to the shifted price
+    sells = ladder('0.1340', WIDE, [ex('s1', 'sell', 1), ex('s2', 'sell', 2)], 'sell', precision=4,
+                   resting={'s1': [D('0.1370')]})                 # fresh s2 = 0.1367 <= resting s1
+    assert summary(sells)[1] == ('s2', D('0.1371'), 'FIXED_EDGE+LADDER_SHIFT', True)
+
+
+def test_deeper_range_level_collapses_when_it_cannot_pass_a_shallower_resting_order():
+    levels = [ex('b1', 'buy', 1), rg('b2', 'buy', '1.05', '1.2')]
+    targets = ladder('0.1380', WIDE, levels, 'buy', precision=4, resting={'b1': [D('0.1360'), D('0.1345')]})
+    assert summary(targets)[1] == ('b2', D('0.1365'), 'LEVEL_COLLAPSED', False)   # needs < 0.1345: out of band
+
+
+def test_shallower_level_waits_for_a_deeper_resting_order():
+    # Index falls to 0.1320: fresh b1 = 0.1306, but b2 still rests at 0.1331 (not repriced yet).
+    levels = [ex('b1', 'buy', 1), ex('b2', 'buy', 2)]
+    targets = ladder('0.1320', WIDE, levels, 'buy', precision=4, resting={'b2': [D('0.1331')]})
+    assert summary(targets) == [('b1', D('0.1306'), 'LEVEL_ORDER_WAIT', False),
+                                ('b2', D('0.1293'), 'FIXED_EDGE', True)]
+    equal = ladder('0.1320', WIDE, levels, 'buy', precision=4, resting={'b2': [D('0.1306')]})
+    assert summary(equal)[0] == ('b1', D('0.1306'), 'LEVEL_ORDER_WAIT', False)    # equal is not strictly above
+    sells = ladder('0.1400', WIDE, [ex('s1', 'sell', 1), ex('s2', 'sell', 2)], 'sell', precision=4,
+                   resting={'s2': [D('0.1387')]})
+    assert summary(sells)[0] == ('s1', D('0.1414'), 'LEVEL_ORDER_WAIT', False)
+
+
+def test_own_resting_order_and_ordered_resting_orders_change_nothing():
+    levels = [ex('b1', 'buy', 1), ex('b2', 'buy', 2)]
+    plain = summary(ladder('0.1359', WIDE, levels, 'buy', precision=4))
+    resting = {'b1': [D('0.1345'), D('0.1350')], 'b2': [D('0.1331')]}
+    assert summary(ladder('0.1359', WIDE, levels, 'buy', precision=4, resting=resting)) == plain
+
+
+def test_invalid_resting_price_blocks_the_ladder():
+    from gate_stonk.errors import Unsafe
+    with pytest.raises(Unsafe, match='^INVALID_RESTING_PRICE$'):
+        ladder('0.1359', WIDE, [ex('b1', 'buy', 1)], 'buy', precision=4, resting={'b2': [D('-1')]})
 
 
 # ============================================================================ TOUCH / waiting / self-cross

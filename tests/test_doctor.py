@@ -2,17 +2,24 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from decimal import Decimal
 
 import pytest
 
-from gate_stonk.cli import Deps, main
+from gate_stonk.cli import Deps, ProcessLocks, main
 from gate_stonk.config import load_config
 from gate_stonk.doctor import Doctor
 
 from cli_fakes import FakeHub, FakeResponse, FakeSession, Output, advance, doctor_routes, fixture, write_config
 
 MIDS = {'bybit_perp': Decimal('0.1356'), 'bitget_perp': Decimal('0.1357')}
+
+
+@pytest.fixture(autouse=True)
+def _private_tempdir(tmp_path, monkeypatch):
+    """doctor --probe-write takes the per-key/pair lock in the temp directory: keep it per test."""
+    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path / 'tmp'))
 
 
 def no_iceberg(data):
@@ -243,3 +250,64 @@ def test_doctor_probe_write_skipped_when_open_orders_unreadable(tmp_path, clock,
     assert rc == 1
     assert 'probe' not in venue.calls
     assert 'открытые заявки пары не прочитаны' in out.text
+
+
+@pytest.mark.parametrize('same_state_dir', [True, False])
+def test_doctor_probe_write_refused_while_a_bot_holds_the_locks(tmp_path, clock, monkeypatch, same_state_dir):
+    """Regression: --probe-write sends countdown_cancel_all {timeout: 0} (disarms the pair's
+    DMS for the whole account) and took no process lock, so it could disarm a running bot's
+    DMS. It now runs under ProcessLocks(cfg, live=True): refused while a bot holds the
+    state_dir lock or the per-key/pair lock (another folder, same key and pair)."""
+    monkeypatch.setenv('GATE_API_KEY', 'key-ABCDEFGH-123456')
+    monkeypatch.setenv('GATE_API_SECRET', 'secret-ZYXWVUT-987654')
+    (tmp_path / 'doc').mkdir()
+    path = write_config(tmp_path / 'doc', two_sources=True)
+    bot_path = path
+    if not same_state_dir:
+        (tmp_path / 'bot').mkdir()
+        bot_path = write_config(tmp_path / 'bot', two_sources=True)
+    venue = FakeAccountVenue()
+    out = Output()
+    with ProcessLocks(load_config(bot_path), live=True):        # the running bot
+        rc = main(['doctor', '--seconds', '1', '--probe-write', '--config', str(path)],
+                  deps=doctor_deps(out, clock, FakeSession(doctor_routes()), venue=venue))
+        assert rc == 2
+        assert 'doctor --probe-write отклонён' in out.text and 'DMS' in out.text
+        assert venue.calls == []                                 # nothing read, nothing probed
+        out = Output()                                           # read-only doctor still allowed
+        rc = main(['doctor', '--seconds', '1', '--config', str(path)],
+                  deps=doctor_deps(out, clock, FakeSession(doctor_routes()), venue=venue))
+        assert rc == 0, out.text
+        assert 'probe' not in venue.calls
+    venue = FakeAccountVenue()
+    out = Output()
+    rc = main(['doctor', '--seconds', '1', '--probe-write', '--config', str(path)],
+              deps=doctor_deps(out, clock, FakeSession(doctor_routes()), venue=venue))
+    assert rc == 0, out.text
+    assert 'probe' in venue.calls                                # free locks: the probe runs
+
+
+def test_doctor_probe_write_holds_the_locks_while_running(tmp_path, clock, monkeypatch):
+    """A bot cannot start during the probe: the locks are held for the whole doctor run."""
+    monkeypatch.setenv('GATE_API_KEY', 'key-ABCDEFGH-123456')
+    monkeypatch.setenv('GATE_API_SECRET', 'secret-ZYXWVUT-987654')
+    path = write_config(tmp_path, two_sources=True)
+    cfg = load_config(path)
+    seen = []
+
+    class LockCheckingVenue(FakeAccountVenue):
+        def probe_write_permission(self):
+            from gate_stonk.cli import LockBusy
+            try:
+                with ProcessLocks(cfg, live=True):
+                    seen.append('free')
+            except LockBusy:
+                seen.append('busy')
+            return super().probe_write_permission()
+
+    venue = LockCheckingVenue()
+    out = Output()
+    rc = main(['doctor', '--seconds', '1', '--probe-write', '--config', str(path)],
+              deps=doctor_deps(out, clock, FakeSession(doctor_routes()), venue=venue))
+    assert rc == 0, out.text
+    assert seen == ['busy']

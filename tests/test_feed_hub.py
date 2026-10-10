@@ -234,6 +234,77 @@ def test_cross_transport_ordering_keeps_the_newer_snapshot(hub, clock):
         put(hub, 'bitget_perp', book(clock[0], update_id=4), source='rest')
 
 
+@pytest.mark.parametrize('first, then', [('rest', 'ws'), ('ws', 'rest')])
+def test_stale_frame_older_than_the_other_transport_never_wipes_the_newer_snapshot(hub, clock, first, then):
+    """A delayed/quiet push that fails only the event-age check and is not newer than the
+    other transport's stored snapshot is dropped as out of order (books and tickers)."""
+    clock[0] += 2.0
+    fresh_book, fresh_ticker = book(clock[0], update_id=1), ticker(clock[0])
+    put(hub, GATE_SPOT_KEY, fresh_book, source=first)
+    put(hub, 'gate_perp', fresh_ticker, source=first)
+    clock[0] += 1.1                                                     # frames below: event 3.1 s old
+    put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=3100, update_id=10), source=then)
+    put(hub, 'gate_perp', ticker(clock[0], age_ms=3100), source=then)
+    assert hub.spot_book() is fresh_book and hub.spot_book_error() is None
+    assert hub.source_snapshot('gate_perp').ticker is fresh_ticker
+    for key in (GATE_SPOT_KEY, 'gate_perp'):
+        assert hub._counters[key]['rejected'] == 0 and hub._counters[key]['dropped_out_of_order'] == 1
+        assert hub.diagnostics()[key]['ok']
+        health = hub.quote_health.snapshot()[key]                       # no stale streak -> no reconnect
+        assert health['error'] is None and health['invalid_total'] == 0
+
+
+def test_stale_frames_still_invalidate_unless_superseded_by_the_other_transport(hub, clock):
+    t0 = clock[0]
+    # Same transport: staleness invalidates (reference behaviour).
+    put(hub, GATE_SPOT_KEY, book(t0), source='rest')
+    clock[0] += 1.0
+    with pytest.raises(Unsafe, match='^STALE_EVENT_OR_CLOCK_SKEW$'):
+        put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=3100), source='rest')
+    assert hub.spot_book() is None and hub.spot_book_error() == 'STALE_EVENT_OR_CLOCK_SKEW'
+    # Stale but NEWER than the other transport's snapshot: invalidates.
+    put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=2900), source='rest')
+    with pytest.raises(Unsafe, match='^STALE_EVENT_OR_CLOCK_SKEW$'):
+        put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=-2100))           # future-dated (clock skew)
+    assert hub.spot_book() is None
+    put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=2900), source='rest')
+    clock[0] += 0.2
+    with pytest.raises(Unsafe, match='^STALE_EVENT_OR_CLOCK_SKEW$'):
+        put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=3050))            # 50 ms newer than the REST book
+    assert hub.spot_book() is None
+    # Structural failures from the other transport still invalidate a fresh snapshot.
+    put(hub, GATE_SPOT_KEY, book(clock[0]), source='rest')
+    with pytest.raises(Unsafe, match='^CROSSED_BOOK$'):
+        put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=3100, bids=(('101', '1'),)))
+    assert hub.spot_book() is None and hub.spot_book_error() == 'CROSSED_BOOK'
+    # Tickers: stale and newer than the other transport -> invalidated.
+    put(hub, 'gate_perp', ticker(clock[0], age_ms=2900), source='rest')
+    clock[0] += 0.2
+    with pytest.raises(Unsafe, match='^STALE_EVENT_OR_CLOCK_SKEW$'):
+        put(hub, 'gate_perp', ticker(clock[0], age_ms=3050))
+    assert hub.source_snapshot('gate_perp').ticker is None
+    assert hub._counters[GATE_SPOT_KEY]['dropped_out_of_order'] == 0
+
+
+def test_rest_refresher_polls_when_event_time_freezes_under_fresh_receipts(clock):
+    """A stream re-pushing a quiet snapshot keeps receipts fresh while its event time ages:
+    the refresher fetches REST before the pushes fail the 3 s event-age check."""
+    spot = RestAdapter(GATE_SPOT_KEY, after=1.5)
+    hub = FeedHub(FakeConfig(), adapters=[spot], start_threads=False, http=object())
+    t0 = clock[0]
+    put(hub, GATE_SPOT_KEY, book(t0, update_id=5))
+    clock[0] += 1.5
+    put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=1500, update_id=5))   # receipt 0 s, event 1.5 s
+    assert hub.refresh_once() == []                                     # threshold not exceeded yet
+    clock[0] += 0.1
+    put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=1600, update_id=5))
+    assert hub.refresh_once() == [GATE_SPOT_KEY]                        # event 1.6 s > 1.5 s
+    assert hub.diagnostics()[GATE_SPOT_KEY]['source'] == 'rest'
+    clock[0] += 1.5                                                     # the quiet push is now 3.1 s old
+    put(hub, GATE_SPOT_KEY, book(clock[0], age_ms=3100, update_id=5))   # older than REST: dropped
+    assert hub.spot_book_error() is None
+
+
 def test_error_update_invalidates_only_that_key(hub, clock):
     put(hub, 'bitget_perp', book(clock[0]))
     put(hub, 'bybit_perp', book(clock[0]))
@@ -410,13 +481,14 @@ class RestAdapter:
     venue = 'fake'
 
     def __init__(self, key: str, *, min_interval: float = 0.0, fail: BaseException | None = None,
-                 after: float | None = None) -> None:
+                 after: float | None = None, bid: str = '100', ask: str = '101') -> None:
         self.key = key
         self.calls: list[tuple] = []
         self.fail = fail
         self.rest_min_interval = min_interval
         self.rest_refresh_after_seconds = after
         self.payload = None
+        self.bid, self.ask = bid, ask
 
     def rest_snapshot(self, http, timeout, now, wall_ms):
         self.calls.append((http, timeout, now, wall_ms))
@@ -424,7 +496,7 @@ class RestAdapter:
             raise self.fail
         if self.payload is not None:
             return self.payload
-        return [Update('book', self.key, book=Book(lv(('100', '1')), lv(('101', '1')), now, wall_ms, None))]
+        return [Update('book', self.key, book=Book(lv((self.bid, '1')), lv((self.ask, '1')), now, wall_ms, None))]
 
 
 def test_rest_refresher_polls_only_after_the_receipt_age_threshold(clock):
@@ -441,7 +513,7 @@ def test_rest_refresher_polls_only_after_the_receipt_age_threshold(clock):
 
 
 def test_rest_refresher_respects_min_interval_and_lighter_two_seconds(clock):
-    fast, slow = RestAdapter('bitget_perp', fail=OSError('down')), RestAdapter('bybit_perp', min_interval=2.0)
+    fast, slow = RestAdapter('bitget_perp'), RestAdapter('bybit_perp', min_interval=2.0)
     cfg = FakeConfig([src('bitget_perp', rest=0.5), src('bybit_perp', 'bybit_linear', rest=0.5)])
     hub = FeedHub(cfg, adapters=[fast, slow], start_threads=False, http=object())
     assert hub.refresh_once() == ['bitget_perp', 'bybit_perp']         # no data at all: poll now
@@ -452,9 +524,140 @@ def test_rest_refresher_respects_min_interval_and_lighter_two_seconds(clock):
     clock[0] += 1.0                                                     # book is 1.0 s old (> 0.5)
     assert hub.refresh_once() == ['bitget_perp', 'bybit_perp']
     assert len(fast.calls) == 3 and len(slow.calls) == 2
+    row = hub.diagnostics()['bitget_perp']['rest_refresh']
+    assert row['failures'] == 0 and row['backoff_seconds'] == 0.0 and not row['in_flight']
+
+
+def test_rest_refresher_backs_off_after_failures_and_resets_on_success(clock):
+    adapter = RestAdapter('bitget_perp', fail=OSError('down'))
+    hub = FeedHub(FakeConfig([src('bitget_perp', rest=0.5)]), adapters=[adapter], start_threads=False,
+                  http=object())
+    start = clock[0]
+    polled_at = []
+    for _ in range(int(40 / 0.25)):
+        if hub.refresh_once():
+            polled_at.append(round(clock[0] - start, 2))
+        clock[0] += 0.25
+    # Next poll after 2 x 1 s, then doubling, capped at 10 s (not every 1 s for a dead venue).
+    assert polled_at == [0.0, 2.0, 6.0, 14.0, 24.0, 34.0]
     row = hub.diagnostics()['bitget_perp']
-    assert row['rest_refresh']['failures'] == 3 and row['rest_refresh']['last_error'] == 'OSError'
+    rest = row['rest_refresh']
+    assert rest['failures'] == 6 and rest['consecutive_failures'] == 6 and rest['last_error'] == 'OSError'
+    assert rest['backoff_seconds'] == 10.0 and not rest['in_flight']
     assert row['error'] == NO_DATA                                      # a failed poll never invalidates
+    adapter.fail = None                                                 # venue back: one success resets
+    clock[0] = start + 44.0
+    assert hub.refresh_once() == ['bitget_perp']
+    rest = hub.diagnostics()['bitget_perp']['rest_refresh']
+    assert (rest['consecutive_failures'], rest['backoff_seconds'], rest['next_poll_monotonic']) == (0, 0.0, None)
+    clock[0] += 1.0                                                     # REST book 1 s old (> 0.5): the
+    assert hub.refresh_once() == ['bitget_perp']                        # plain 1 s floor applies again
+
+
+def test_rest_refresher_backoff_never_undercuts_the_lighter_floor(clock):
+    adapter = RestAdapter('lighter_perp', fail=TimeoutError('read timeout'))
+    hub = FeedHub(FakeConfig([src('lighter_perp', 'lighter', quote='USDC', rest=0.5)]), adapters=[adapter],
+                  start_threads=False, http=object())
+    start = clock[0]
+    polled_at = []
+    for _ in range(int(40 / 0.25)):
+        if hub.refresh_once():
+            polled_at.append(round(clock[0] - start, 2))
+        clock[0] += 0.25
+    assert polled_at == [0.0, 4.0, 12.0, 22.0, 32.0]                    # 2 x 2 s, 4 x 2 s, cap 10 s
+    assert min(b - a for a, b in zip(polled_at, polled_at[1:])) >= 2.0
+
+
+class DeferredExecutor:
+    """``rest_executor`` that holds the jobs of ``hang`` keys (a venue hanging until the
+    HTTP timeout) and runs every other key's job at once (no real threads)."""
+
+    def __init__(self, hang=()) -> None:
+        self.hang = set(hang)
+        self.held: list[tuple[str, object]] = []
+        self.submitted: list[str] = []
+
+    def __call__(self, key, job) -> None:
+        self.submitted.append(key)
+        if key in self.hang:
+            self.held.append((key, job))
+        else:
+            job()
+
+    def release(self) -> None:
+        held, self.held = self.held, []
+        for _, job in held:
+            job()
+
+
+def test_rest_refresher_hanging_venue_never_delays_the_traded_book_or_fx(clock):
+    """Bitget's REST call hangs (the plan lists index sources first); gate_spot and fx are
+    still polled on their own schedule and the traded book never goes stale."""
+    cfg = FakeConfig([src('bitget_perp', rest=1.5), src('lighter_perp', 'lighter', quote='USDC')],
+                     fx_mode='binance_spot')
+    bitget = RestAdapter('bitget_perp', fail=TimeoutError('read timeout'))
+    spot, fx = RestAdapter(GATE_SPOT_KEY, after=1.5), RestAdapter(FX_KEY, after=1.5, bid='0.9999', ask='1.0000')
+    executor = DeferredExecutor(hang={'bitget_perp'})
+    hub = FeedHub(cfg, adapters=[bitget, spot, fx], start_threads=False, http=object(), rest_executor=executor)
+    assert [key for key, *_ in hub._refresh_plan()] == ['bitget_perp', GATE_SPOT_KEY, FX_KEY]
+    start = clock[0]
+    for _ in range(int(10 / 0.25)):
+        hub.refresh_once()
+        assert hub.spot_book_error() is None
+        assert hub.fx_snapshot().error is None
+        clock[0] += 0.25
+    assert executor.submitted.count('bitget_perp') == 1                 # one request in flight, not re-sent
+    assert hub._rest['bitget_perp']['in_flight'] and bitget.calls == []
+    assert len(spot.calls) >= 6 and len(fx.calls) >= 6                  # ~every 1.5-1.75 s for 10 s
+    clock[0] = start + 10.0
+    executor.release()                                                  # the hung call times out now
+    rest = hub._rest['bitget_perp']
+    assert not rest['in_flight'] and rest['last_error'] == 'TimeoutError'
+    assert rest['next_poll_monotonic'] == start + 12.0                  # backoff from the failure time
+    assert 'bitget_perp' not in hub.refresh_once()
+    clock[0] = start + 12.0
+    assert 'bitget_perp' in hub.refresh_once()
+
+
+def test_rest_refresher_default_threads_isolate_a_hanging_venue(clock):
+    """With threads, each poll runs in its own daemon thread: refresh_once returns at once
+    and the traded book is polled while another venue's request is still blocked."""
+    release, spot_done = threading.Event(), threading.Event()
+
+    class Hanging(RestAdapter):
+        def rest_snapshot(self, http, timeout, now, wall_ms):
+            self.calls.append(now)
+            release.wait(5)
+            raise TimeoutError('read timeout')
+
+    class Spot(RestAdapter):
+        def rest_snapshot(self, http, timeout, now, wall_ms):
+            try:
+                return super().rest_snapshot(http, timeout, now, wall_ms)
+            finally:
+                spot_done.set()
+
+    hanging, spot = Hanging('bitget_perp'), Spot(GATE_SPOT_KEY, after=1.5)
+    hub = FeedHub(FakeConfig(), adapters=[hanging, spot], start_threads=True, http=object())
+    try:
+        started = time.perf_counter()
+        assert hub.refresh_once() == ['bitget_perp', GATE_SPOT_KEY]
+        assert time.perf_counter() - started < 1.0                      # not blocked by the hung venue
+        assert spot_done.wait(2)
+        deadline = time.perf_counter() + 2
+        while hub.spot_book() is None and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        assert hub.spot_book() is not None and hub._rest['bitget_perp']['in_flight']
+        clock[0] += 2.0
+        assert 'bitget_perp' not in hub.refresh_once()                  # still in flight: never doubled
+        assert len(hanging.calls) == 1
+    finally:
+        release.set()
+    deadline = time.perf_counter() + 2
+    while hub._rest['bitget_perp']['in_flight'] and time.perf_counter() < deadline:
+        time.sleep(0.01)
+    assert hub._rest['bitget_perp']['last_error'] == 'TimeoutError'
+    hub.stop()
 
 
 def test_rest_refresher_lighter_floor_applies_without_adapter_declaration(clock):

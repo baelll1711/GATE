@@ -117,6 +117,15 @@ def test_protocol_shape_and_initial_balances(env):
     assert venue.open_orders() == [] and venue.my_trades(0, T0_MS) == []
 
 
+def test_account_wide_reads_see_no_other_pairs(env):
+    venue, *_ = env
+    venue.place(req('t-stk1-b1-a01', 'buy', '0.9000', '100'))
+    assert venue.account_open_orders() == []          # own pair orders are not "other pairs"
+    assert venue.account_trades(0, T0_MS) == []
+    with pytest.raises(NotSent):
+        venue.account_trades(T0_MS, 0)
+
+
 def test_place_locks_balances_and_cancel_releases(env):
     venue, hub, *_ = env
     buy = venue.place(req('t-stk1-b1-a01', 'buy', '0.9000', '100'))

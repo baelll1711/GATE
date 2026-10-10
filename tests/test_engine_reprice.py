@@ -180,3 +180,70 @@ def test_amended_order_keeps_its_amount_without_limit_reduction(tmp_path, clock)
     rig.venue.funds['USDT'] = D('0')                 # money really shrank: the amended orders no longer fit
     rig.step(5)
     assert {r['cancel_reason'] for r in rig.rows()} == {'LIMIT_REDUCTION'}
+
+
+def test_live_own_levels_keep_the_price_an_amend_just_left(tmp_path, clock):
+    """Regression: right after an amend the cached Gate book (older than the amend) still
+    shows the bot's volume at the OLD price; it must stay subtracted from the depth for
+    2 s, exactly like a just-closed order, or a range level counts it as foreign volume."""
+    rig = make_rig(tmp_path, clock, usdt='1000', mode='live', overrides=AMEND)
+    rig.step()
+    b1 = rig.row('buy:b1')
+    rig.hub.set_index('0.13644')
+    assert rig.step(3.5) == 'RUNNING'
+    amended = rig.store.order(b1['text'])
+    assert amended['price'] == D('0.1350') and amended['prior_prices'][0][0] == D('0.1345')
+    left_ms = amended['prior_prices'][0][1]
+    assert rig.engine._own_levels('buy', left_ms - 100) == {D('0.1350'): b1['qty'], D('0.1345'): b1['qty']}
+    assert rig.engine._own_levels('buy', left_ms + 2000) == {D('0.1350'): b1['qty'], D('0.1345'): b1['qty']}
+    assert rig.engine._own_levels('buy', left_ms + 2001) == {D('0.1350'): b1['qty']}
+
+
+def test_recreated_deeper_level_never_rests_above_a_shallower_resting_order(tmp_path, clock):
+    """Regression: b1 and b2 are kept by deeper_tolerance_pct after the index rises; when
+    b2 fills, its slot was re-created at its fresh 2 % target ABOVE the resting b1 (an
+    inverted ladder). Monotonicity now also holds against resting orders of other levels."""
+    overrides = {'pair.mode': 'buy', 'pair.buy.deeper_tolerance_pct': 2.0}
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=overrides)
+    rig.step()
+    old = levels(rig)
+    assert (old['b1']['price'], old['b2']['price']) == (D('0.1345'), D('0.1331'))
+    rig.hub.set_index('0.1380')                  # fresh targets b1 0.1366, b2 0.1352: both kept (deeper)
+    rig.step(5)
+    assert rig.venue.cancel_log == []
+    rig.venue.fill(old['b2']['order_id'], old['b2']['qty'])
+    rig.step(1)
+    rig.settle()
+    new = levels(rig)
+    assert new['b1']['text'] == old['b1']['text'] and new['b1']['price'] == D('0.1345')
+    assert new['b2']['text'] != old['b2']['text']
+    assert new['b2']['price'] == D('0.1344') < new['b1']['price']   # shifted below the resting b1
+    assert rig.engine.targets['buy:b2'].reason == 'FIXED_EDGE+LADDER_SHIFT'
+    for _ in range(4):                           # stable: nothing is repriced back and forth
+        rig.step(5)
+    assert rig.venue.cancel_log == [] and levels(rig)['b2']['price'] == D('0.1344')
+
+
+def test_shallower_level_waits_for_a_deeper_resting_order_before_re_creation(tmp_path, clock):
+    """A shallower slot is not re-created at or below a resting deeper order (that order
+    is within its reprice threshold); it waits with LEVEL_ORDER_WAIT until it can be
+    placed strictly above it."""
+    overrides = {'pair.mode': 'buy', 'pair.buy.levels': [{'id': 'b1', 'edge_pct': 1.0, 'order_notional_usdt': 20},
+                                                         {'id': 'b2', 'edge_pct': 1.05, 'order_notional_usdt': 20}]}
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=overrides)
+    rig.step()
+    old = levels(rig)
+    assert (old['b1']['price'], old['b2']['price']) == (D('0.1345'), D('0.1344'))
+    rig.hub.set_index('0.13585')                 # fresh b1 0.1344, b2 0.1343: both within the 0.15 % threshold
+    rig.step(5)
+    assert rig.venue.cancel_log == []
+    rig.venue.fill(old['b1']['order_id'], old['b1']['qty'])
+    rig.step(1)
+    rig.settle()
+    assert rig.store.order(old['b1']['text'])['state'] == 'closed'
+    assert rig.row('buy:b1') is None                              # not at 0.1344 == the resting b2
+    assert rig.engine.slot_states['buy:b1'] == 'LEVEL_ORDER_WAIT'
+    assert levels(rig)['b2']['text'] == old['b2']['text']
+    rig.hub.set_index('0.1359')                  # fresh b1 0.1345 is strictly above b2 again
+    rig.step(5)
+    assert rig.row('buy:b1')['price'] == D('0.1345') > rig.row('buy:b2')['price']

@@ -878,6 +878,18 @@ class PaperVenue:
                 trades = [self._venue_trade(row) for row in rows]
             return sorted(trades, key=trade_sort_key)
 
+    def account_open_orders(self) -> list[VenueOrder]:
+        """Open orders of OTHER pairs: the simulated account trades one pair only."""
+        return []
+
+    def account_trades(self, from_ms: int, to_ms: int) -> list[VenueTrade]:
+        """Trades of OTHER pairs in the window: none in the simulated account."""
+        try:
+            _window(from_ms, to_ms)
+        except ValueError as exc:
+            raise not_sent(exc) from None
+        return []
+
     def balances(self) -> dict[str, Balance]:
         """{base, quote}: total = available + locked; hold = locked by open orders."""
         self.before_read()

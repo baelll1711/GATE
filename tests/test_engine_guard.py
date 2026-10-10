@@ -92,6 +92,32 @@ def test_index_blocked_cancels_and_blocks_creates(tmp_path, clock):
     assert len(rig.venue.place_log) == placed + 2
 
 
+def test_blocked_index_is_sampled_without_orders(tmp_path, clock):
+    """Regression: with no orders left, a blocked index must still leave index_obs rows
+    (about once a second) so the report's blocked-time share covers the outage."""
+    rig = make_rig(tmp_path, clock, usdt='1000')
+    rig.hub.errors['bybit_perp'] = 'DISCONNECTED'
+    start_ms = int(clock[0] * 1000)
+    for _ in range(100):                                   # 20 s of 0.2 s loop ticks, no orders at all
+        rig.advance(0.2)
+        rig.engine.sample_index()
+    assert rig.rows() == []
+    rows = rig.store.index_obs(start_ms)
+    assert 23 <= len(rows) <= 26                           # one row per ~0.8 s
+    assert all(not r['ok'] and r['reason'].startswith('REQUIRED_SOURCE_INVALID') for r in rows)
+    assert max(b['ts_ms'] - a['ts_ms'] for a, b in zip(rows, rows[1:])) < 1000   # under the report gap cap
+    # With an own order the dense 150 ms sampling still applies.
+    rig.hub.errors.clear()
+    for _ in range(4):
+        rig.step(1)
+    assert rig.rows()
+    mark_ms = int(clock[0] * 1000)
+    for _ in range(10):
+        rig.advance(0.2)
+        rig.engine.sample_index()
+    assert len(rig.store.index_obs(mark_ms + 1)) == 10
+
+
 def test_spot_book_invalid_is_bad_market(tmp_path, clock):
     rig = make_rig(tmp_path, clock, usdt='1000')
     rig.step()
@@ -178,6 +204,44 @@ def test_lost_cancel_retry_schedule_blocks_reads_dms_and_creates(tmp_path, clock
     assert len(rig.venue.cancel_log) == sent + 1
     assert rig.store.order(b1['text'])['cancel_reason'] == 'STOP_TRADING'
     rig.status_json()
+
+
+@pytest.mark.parametrize('cancel_result', ['lost_before', 'refuse'])
+def test_hard_guard_escalates_unconfirmed_routine_cancel_at_once(tmp_path, clock, cancel_result):
+    rig = make_rig(tmp_path, clock, usdt='1000')            # default tolerance 0.15 %
+    rig.step()
+    b1, b2 = rig.row('buy:b1'), rig.row('buy:b2')
+    rig.venue.cancel_plan.extend([cancel_result] * 10)
+    rig.hub.set_index('0.1356')                            # routine PREMIUM_RANGE_CHANGED, reply lost/refused
+    rig.advance(0.2)
+    assert rig.engine.preflight() == 'PREMIUM_RANGE_CHANGED'
+    assert len(rig.venue.cancel_log) == 1
+    rig.hub.set_index('0.1350')                            # b1 0.1345: edge 0.37 % < hard 0.8 %
+    rig.advance(0.2)
+    assert rig.engine.preflight() == 'HARD_MIN_EDGE'      # long before the 5 s retry
+    assert len(rig.venue.cancel_log) == 2 and texts(rig.venue.cancel_log[-1]) == [b1['text']]
+    row = rig.store.order(b1['text'])
+    assert (row['cancel_reason'], row['cancel_attempts']) == ('HARD_MIN_EDGE', 2)
+    assert rig.store.order(b2['text'])['cancel_reason'] == 'PREMIUM_RANGE_CHANGED'   # b2 not in the hard zone
+    for _ in range(10):                                    # escalated once: back on the retry schedule
+        rig.advance(0.2)
+        rig.engine.preflight()
+    assert len(rig.venue.cancel_log) == 2
+
+
+def test_blocked_index_escalates_unconfirmed_routine_cancels(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000')
+    rig.step()
+    rig.venue.cancel_plan.extend(['lost_before'] * 10)
+    rig.hub.set_index('0.1356')
+    rig.advance(0.2)
+    rig.engine.preflight()
+    assert {r['cancel_reason'] for r in rig.rows()} == {'PREMIUM_RANGE_CHANGED'}
+    rig.hub.errors['bybit_perp'] = 'DISCONNECTED'
+    rig.advance(0.2)
+    assert rig.engine.preflight().startswith('BAD_MARKET:')
+    assert len(rig.venue.cancel_log) == 2 and len(rig.venue.cancel_log[-1]) == 2
+    assert all(r['cancel_reason'].startswith('BAD_MARKET:') for r in rig.rows())
 
 
 def test_refused_cancel_reads_continue_but_creates_wait(tmp_path, clock):

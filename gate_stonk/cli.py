@@ -39,6 +39,7 @@ Every external dependency is injectable through ``Deps`` (tests run offline).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -544,10 +545,20 @@ def cmd_doctor(cfg: Config, args: argparse.Namespace, deps: Deps) -> int:
         return EXIT_ERROR
     handlers = configure_logging(cfg, console_level=logging.ERROR) if deps.logging else []
     try:
-        doctor = Doctor(cfg, seconds=args.seconds, probe_write=args.probe_write, http=deps.http,
-                        hub_factory=deps.hub_factory, venue_factory=deps.doctor_venue_factory,
-                        sleep=deps.sleep, out=deps.say)
-        report = doctor.run()
+        # --probe-write sends countdown_cancel_all {timeout: 0}, which disarms the pair's DMS
+        # for the whole account: run it only while holding the bot's locks (state_dir and the
+        # per-key/pair lock), so a running bot is refused and none can start meanwhile.
+        locks = ProcessLocks(cfg, live=True) if args.probe_write else contextlib.nullcontext()
+        with locks:
+            doctor = Doctor(cfg, seconds=args.seconds, probe_write=args.probe_write, http=deps.http,
+                            hub_factory=deps.hub_factory, venue_factory=deps.doctor_venue_factory,
+                            sleep=deps.sleep, out=deps.say)
+            report = doctor.run()
+    except LockBusy as exc:
+        deps.error(f'doctor --probe-write отклонён: запущен другой процесс gate_stonk (занята блокировка '
+                   f'{exc.path}). Проба записи выключила бы DMS (countdown_cancel_all) его заявок. '
+                   'Остановите бота или запустите doctor без --probe-write.')
+        return EXIT_ERROR
     finally:
         remove_logging(handlers)
     return EXIT_OK if report['ok'] else EXIT_FAIL
@@ -630,8 +641,15 @@ class RunRefused(Exception):
         self.message = message
 
 
-class StopRequested(Exception):
-    """Raised in the main thread by the SIGTERM handler."""
+class StopRequested(BaseException):
+    """Raised in the main thread by the SIGTERM / SIGBREAK handler.
+
+    A ``BaseException`` (like ``KeyboardInterrupt``): the generic ``except Exception``
+    blocks of the REST client, the venue and the engine must not swallow it (a swallowed
+    stop used to look like a read failure / unknown create and the bot kept trading).
+    The handler also records the stop on the runner, which the loop checks every tick, so
+    even a stop caught by an ``except BaseException`` cleanup is not lost.
+    """
 
 
 # ============================================================================ run: startup checks
@@ -673,6 +691,10 @@ class StartupChecks:
                 return f'PAIR_METADATA_UNAVAILABLE:{safe_error(exc)}', True
             if (fresh.precision, fresh.amount_precision) != (r.meta.precision, r.meta.amount_precision):
                 return 'PAIR_PRECISION_CHANGED', False
+            # The fresh metadata is authoritative from now on (trade_status, minimums,
+            # maximums may have changed during the outage): the tradability check below,
+            # the engine and the venue must not keep using the snapshot.
+            r.adopt_meta(fresh)
             r.meta_from_snapshot = None
             r.save_meta_snapshot(fresh)
         if not r.live:
@@ -770,14 +792,27 @@ class Runner:
         self.started_ms = int(time.time() * 1000)
         self._postponed: tuple[str, float] | None = None
         self._old_signals: dict[int, Any] = {}
+        self.stop_signal: str | None = None      # set by the signal handler, checked every tick
+        self._shutting_down = False
 
     # ----- signals -----
     def _on_signal(self, signum: int, frame: Any) -> None:
+        """Record the stop; raise ``StopRequested`` only for the FIRST signal and never
+        during shutdown (a repeated SIGTERM must not abort the shutdown cancels)."""
         try:
             name = signal.Signals(signum).name
         except ValueError:
             name = str(signum)
-        raise StopRequested(name)
+        first = self.stop_signal is None
+        if first:
+            self.stop_signal = name
+        if first and not self._shutting_down:
+            raise StopRequested(name)
+
+    def _check_stop(self) -> None:
+        """Re-raise a recorded signal stop (in case the first raise was swallowed)."""
+        if self.stop_signal is not None:
+            raise StopRequested(self.stop_signal)
 
     def install_signals(self) -> None:
         if not self.deps.signals or threading.current_thread() is not threading.main_thread():
@@ -808,6 +843,14 @@ class Runner:
         if self.live:
             return self.venue.pair_meta()
         return (self.deps.meta_factory or _default_meta_factory)(self.cfg, self.http)
+
+    def adopt_meta(self, meta: PairMeta) -> None:
+        """Make freshly fetched pair metadata authoritative for the runner, engine and venue."""
+        self.meta = meta
+        if self.engine is not None:
+            self.engine.meta = meta
+        if self.venue is not None and hasattr(self.venue, 'meta') and self.venue.meta is not meta:
+            self.venue.meta = meta     # paper venue; GateVenue.pair_meta() already stored it
 
     def save_meta_snapshot(self, meta: PairMeta) -> None:
         try:
@@ -931,6 +974,7 @@ class Runner:
         retry_not_before = start
         last_step_started = start - poll
         while True:
+            self._check_stop()
             now = time.monotonic()
             if self.seconds is not None and now - start >= self.seconds:
                 self.exit_reason = f'истекло --seconds {self.seconds:g}'
@@ -984,6 +1028,7 @@ class Runner:
                     and not self.store.orders(active_only=True)):
                 self.exit_reason = f'запуск отклонён: {self.refusal}'
                 return EXIT_ERROR
+            self._check_stop()
             hub.wake.wait(tick)
             hub.wake.clear()
 
@@ -1000,6 +1045,7 @@ class Runner:
                 if self.fill_wakeup is not None:
                     self.fill_wakeup.start()
             self.checks.run(time.monotonic())
+            self._check_stop()
             self.deps.say(f"gate_stonk {'LIVE' if self.live else 'paper'} {self.cfg.currency_pair} запущен; "
                           f'статус: {status_path(self.cfg)}. Остановка: Ctrl+C или файл STOP_TRADING.')
             self.exit_code = self.loop()
@@ -1021,6 +1067,7 @@ class Runner:
             self.deps.error(f'Ошибка: {safe_error(exc)}')
             self.exit_code = EXIT_ERROR
         finally:
+            self._shutting_down = True        # a later SIGTERM/SIGBREAK only records, never interrupts
             self.shutdown()
             self.restore_signals()
         return self.exit_code

@@ -36,7 +36,7 @@ from .errors import ReadError, TransientUnsafe, Unsafe
 from .ledger import signed
 from .marks import MARK_HORIZONS
 from .store import utc_text
-from .types import Balance, VenueOrder
+from .types import Balance, VenueOrder, VenueTrade
 
 LOG = logging.getLogger(__name__)
 
@@ -46,6 +46,16 @@ LOG = logging.getLogger(__name__)
 Observation = tuple[str, Decimal, int, Any, Decimal, Any]
 
 UNBOUND_SEARCH_BACK_MS = 60_000      # finished-orders window starts this long before the oldest unbound row
+# Account-wide foreign-activity scan (orders / trades on OTHER pairs of the account): one
+# GET /spot/open_orders (all pairs) + one GET /spot/my_trades without currency_pair, on the
+# FIRST pass after startup and then every 6th reconciliation pass (~30 s at poll 5 s). Each
+# read has its own private_read bucket (/spot/open_orders; /spot/my_trades shared with the
+# pair read), so the extra cost is ~2 requests per 6 passes. The trade window continues
+# from its own watermark (meta ``account_trades_ms``) with the same 60 s overlap as the
+# pair window, so a slower cadence never leaves a gap.
+ACCOUNT_SCAN_EVERY_PASSES = 6
+ACCOUNT_TRADES_OVERLAP_MS = 60_000
+FOREIGN_GRACE_MS = 2000              # same campaign start grace as Store.record_trades
 FUTURE_STATUS_MS = 2000              # an order status stamped further in the future is invalid
 ROUTINE_REASONS = frozenset({'REPRICE', 'PREMIUM_RANGE_CHANGED', 'LIMIT_REDUCTION', 'MODIFY', 'AMEND'})
 AMEND_OPEN = ('sent', 'unknown')
@@ -144,6 +154,8 @@ class Reconciler:
         new = self._ingest(trades, settlement_only)
         self._fills_watermark = to_ms
         new += self._order_trades_fallback(observations, settlement_only)
+        # (E2) account-wide foreign activity on other pairs (slower cadence, before (H)).
+        self._scan_account(settlement_only, start_ms, to_ms)
 
         # (F) consistency + terminal state machine (creation order).
         now = self._now_ms()
@@ -189,14 +201,32 @@ class Reconciler:
 
         # (G) control read before ANY release (once per batch, only when mature).
         if to_close:
-            _opens2, by_id2 = self._read_opens()
-            own_now = {row['order_id'] for row in self.store.orders() if row['order_id'] is not None}
-            self._check_foreign_opens(by_id2, own_now, settlement_only)
+            opens2, by_id2 = self._read_opens()
+            texts2: dict[str, list[VenueOrder]] = {}
+            for order in opens2:
+                if order.text:
+                    texts2.setdefault(order.text, []).append(order)
+            # A terminal-observed row reappears by order_id, or (still unbound: lost create
+            # reply) by its client text. Bind BEFORE the foreign check so the bot's own
+            # order is never booked as foreign evidence.
             reappeared = []
             for text in terminal:
                 row = self.store.order(text)
-                if row is not None and row['order_id'] is not None and row['order_id'] in by_id2:
+                if row is None:
+                    continue
+                if row['order_id'] is None:
+                    matches = texts2.get(text) or []
+                    if len(matches) > 1:
+                        raise Unsafe('DUPLICATE_OPEN_ORDER_TEXT')
+                    if matches:
+                        self.store.update_order(text, order_id=matches[0].order_id)
+                        self._diag('ORDER_BOUND_BY_TEXT', text=text, order_id=matches[0].order_id,
+                                   source='control_read')
+                        reappeared.append(text)
+                elif row['order_id'] in by_id2:
                     reappeared.append(text)
+            own_now = {row['order_id'] for row in self.store.orders() if row['order_id'] is not None}
+            self._check_foreign_opens(by_id2, own_now, settlement_only)
             if reappeared:
                 for text in reappeared:
                     self._terminal_recheck.pop(text, None)
@@ -316,11 +346,23 @@ class Reconciler:
         return found
 
     def _create_expired(self, row: dict) -> bool:
-        """The create's x-gate-exptime (signing time + request_expiry) has surely passed."""
+        """The create's x-gate-exptime (signing time + request_expiry) has surely passed.
+
+        The window starts when the request carrying the row was SENT (``sent_ms``, stamped
+        right before signing; ``created_ms`` for rows written before that column existed or
+        never sent). Max-safe: when this process sent the request, the monotonic time since
+        the send must ALSO cover the window, so a forward wall-clock jump cannot release a
+        reservation early; after a restart only the wall clock is available.
+        """
         app, safety = self.cfg.app, self.cfg.safety
         margin = (float(app['request_expiry_seconds']) + 2 * float(app['request_timeout_seconds'])
                   + float(safety['unknown_create_margin_seconds']))
-        return self._now_ms() > int(row['created_ms']) + int(margin * 1000)
+        sent = row.get('sent_ms')
+        anchor = int(sent) if sent is not None else int(row['created_ms'])
+        if self._now_ms() <= anchor + int(margin * 1000):
+            return False
+        mono = self._sent_mono.get(row['text']) if sent is not None else None
+        return mono is None or time.monotonic() - mono >= margin
 
     # ------------------------------------------------------------------ validation
     def _validate_own(self, row: dict, order: VenueOrder) -> dict:
@@ -396,6 +438,54 @@ class Reconciler:
         self.store.require_account_review('FOREIGN_OPEN_ORDER_USE_EXCLUSIVE_ACCOUNT', self._now_ms())
         self.store.record_external_orders(foreign, self._now_ms())
 
+    # ------------------------------------------------------------------ account-wide activity
+    def _account_scan_supported(self) -> bool:
+        return (callable(getattr(self.venue, 'account_open_orders', None))
+                and callable(getattr(self.venue, 'account_trades', None)))
+
+    def _account_scan_due(self) -> bool:
+        return self._account_scan_supported() and self._account_scan_countdown <= 0
+
+    def _scan_account(self, settlement_only: bool, start_ms: int, to_ms: int) -> None:
+        """Foreign orders or trades on OTHER pairs of the account -> STOP_ACCOUNT_REVIEW
+        (customer rule: the account is exclusive to the bot). Evidence is always kept
+        (``external_orders`` / ``external_fills``); outside settlement the pass stops with
+        the review code so own orders are cancelled at once. Cadence: see
+        ``ACCOUNT_SCAN_EVERY_PASSES``."""
+        if not self._account_scan_supported():
+            return
+        if self._account_scan_countdown > 0:
+            self._account_scan_countdown -= 1
+            return
+        others = self.venue.account_open_orders()
+        if not isinstance(others, list) or not all(isinstance(order, VenueOrder) for order in others):
+            raise ReadError('INVALID_ACCOUNT_OPEN_ORDERS')
+        others = [order for order in others if order.currency_pair != self.pair]
+        watermark = int(self.store.meta('account_trades_ms', start_ms) or start_ms)
+        from_ms = max(0, start_ms - FOREIGN_GRACE_MS, watermark - ACCOUNT_TRADES_OVERLAP_MS)
+        trades = self.venue.account_trades(from_ms, max(from_ms, to_ms))
+        if not isinstance(trades, list) or not all(isinstance(trade, VenueTrade) for trade in trades):
+            raise ReadError('INVALID_ACCOUNT_TRADES')
+        foreign_trades = [trade for trade in trades if trade.currency_pair != self.pair
+                          and trade.create_time_ms >= start_ms - FOREIGN_GRACE_MS]
+        now = self._now_ms()
+        if others or foreign_trades:
+            self._diag('FOREIGN_ACCOUNT_ACTIVITY', open_orders=len(others), trades=len(foreign_trades),
+                       pairs=sorted({o.currency_pair for o in others} | {t.currency_pair for t in foreign_trades})[:20])
+        if foreign_trades:
+            self.store.require_account_review('FOREIGN_FILL', now)
+            self.store.quarantine_external_trades(foreign_trades, now)
+        if others:
+            self.store.require_account_review('FOREIGN_OPEN_ORDER_USE_EXCLUSIVE_ACCOUNT', now)
+            self.store.record_external_orders(others, now)
+        self.store.set_meta('account_trades_ms', max(watermark, to_ms))
+        self._account_scan_countdown = ACCOUNT_SCAN_EVERY_PASSES - 1
+        if not settlement_only:
+            if foreign_trades:
+                raise Unsafe('FOREIGN_FILL')
+            if others:
+                raise Unsafe('FOREIGN_OPEN_ORDER_USE_EXCLUSIVE_ACCOUNT')
+
     # ------------------------------------------------------------------ executions
     def _ingest(self, trades: Any, settlement_only: bool) -> list[dict]:
         if not isinstance(trades, list):
@@ -442,6 +532,7 @@ class Reconciler:
         self.store.close_order(text, status, now, finish_as=finish_as if isinstance(finish_as, str) and finish_as
                                else None)
         self._terminal_recheck.pop(text, None)
+        self._sent_mono.pop(text, None)
         self._last_closed_slot[slot] = (text, time.monotonic())
         self._safely(self.store.delete_meta, 'cancel_rejected:' + text)
         self.counters['closed'] += 1
@@ -481,12 +572,18 @@ class Reconciler:
     # ------------------------------------------------------------------ withdrawals / snapshots
     def _reconcile_positions(self) -> None:
         """Same shortfall (bot qty above the base balance) with no new fills in two complete
-        reconciliations >= terminal_settle_seconds apart -> booked as a withdrawal."""
+        reconciliations >= terminal_settle_seconds apart -> booked as a withdrawal, but only
+        when no fill happened since the last CLEAN reconciliation (balance covered the bot
+        position; meta ``ledger_clean``). Otherwise the withdrawal cannot be ordered against
+        those fills, the average cost would be a guess: account review instead."""
         position = self.store.position()
         balance = self.balances.get(self.base, Balance(ZERO, ZERO))
         shortfall = position.qty - balance.total
         if position.qty <= 0 or shortfall < self.meta.lot:
             self._mismatch = None
+            stored = self.store.meta('ledger_clean')
+            if not isinstance(stored, dict) or stored.get('fills') != int(position.fills):
+                self.store.set_meta('ledger_clean', {'fills': int(position.fills), 'at_ms': self._now_ms()})
             return
         marker = (shortfall, position.fills)
         if self._mismatch is None or self._mismatch[0] != marker:
@@ -495,6 +592,21 @@ class Reconciler:
                        balance=balance.total)
             return
         if time.monotonic() - self._mismatch[1] < self._settle_seconds:
+            return
+        clean = self.store.meta('ledger_clean')
+        clean_fills = clean.get('fills') if isinstance(clean, dict) else None
+        if not isinstance(clean_fills, int) or position.fills > clean_fills:
+            # Fills since the last clean reconciliation: the withdrawal may precede some of
+            # them, so booking it after all of them at the blended average is not exact.
+            self._mismatch = None
+            self._diag('WITHDRAWAL_ORDER_UNKNOWN', shortfall=shortfall, position_qty=position.qty,
+                       balance=balance.total, fills=position.fills, clean_fills=clean_fills)
+            self.store.require_account_review('WITHDRAWAL_ORDER_UNKNOWN', self._now_ms())
+            self.event('withdrawal_order_unknown',
+                       f'{self.base}: на балансе {fmt(balance.total)}, а куплено ботом и не продано '
+                       f'{fmt(position.qty)}. Похоже на вывод токенов, но после последней чистой сверки были '
+                       f'исполнения: порядок вывода и сделок неизвестен, средняя цена не пересчитана. '
+                       f'Нужна проверка счёта; новые заявки заблокированы.')
             return
         removed, cost = self.store.record_transfer_out(shortfall, balance.total, self._now_ms(),
                                                        base=self.base, quote=self.quote)

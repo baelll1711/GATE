@@ -627,6 +627,62 @@ def test_amend_old_price_only_for_fills_before_the_amend(store):
         rec(store, [trade(order_id='2', tid='4', price='2', ms=NOW + 3001)], now=NOW + 5000)
 
 
+def test_own_levels_keep_the_price_an_amend_left_for_two_seconds(store):
+    row = reserve(store, qty='10', price='2', order_id='1')
+    store.begin_amend(row['text'], price=D('2.05'), amend_text='t-rp-1', now_ms=NOW)
+    store.confirm_amend(row['text'], NOW + 1000)
+    # A book snapshot up to 2 s older than the amend may still show the old price.
+    assert store.own_levels('buy', NOW + 500) == {D('2.05'): D(10), D(2): D(10)}
+    assert store.own_levels('buy', NOW + 3000) == {D('2.05'): D(10), D(2): D(10)}
+    assert store.own_levels('buy', NOW + 3001) == {D('2.05'): D(10)}
+
+
+def test_mark_sent_stamps_reserved_rows_once(store):
+    first = reserve(store, order_id=None)
+    second = reserve(store, level='b2', order_id=None)
+    assert first['sent_ms'] is None
+    store.mark_sent([first['text'], second['text']], NOW + 20_000)
+    assert store.order(first['text'])['sent_ms'] == NOW + 20_000
+    assert store.order(second['text'])['created_ms'] == NOW
+    with pytest.raises(Unsafe, match='^ORDER_ALREADY_SENT$'):
+        store.mark_sent([first['text']], NOW + 30_000)
+    with pytest.raises(Unsafe, match='^MISSING_LOCAL_ORDER$'):
+        store.mark_sent(['t-stk1-b9-none'], NOW)
+    with pytest.raises(ValueError):
+        store.mark_sent([], NOW)
+
+
+def test_sent_ms_column_is_added_to_an_older_database(tmp_path):
+    import sqlite3
+    path = tmp_path / 'old.sqlite3'
+    old = Store(path)
+    old.initialize(IDENTITY, NOW)
+    row = reserve(old, order_id=None)
+    old.close()
+    db = sqlite3.connect(str(path))
+    db.execute('ALTER TABLE orders DROP COLUMN sent_ms')          # the schema before the column existed
+    db.commit()
+    db.close()
+    reopened = Store(path)
+    reopened.initialize(IDENTITY, NOW)
+    assert reopened.order(row['text'])['sent_ms'] is None         # old rows: expiry falls back to created_ms
+    reopened.mark_sent([row['text']], NOW + 5)
+    assert reopened.order(row['text'])['sent_ms'] == NOW + 5
+    reopened.close()
+
+
+def test_quarantine_external_trades_of_other_pairs(store):
+    foreign = trade(order_id='77', tid='901', pair='BTC_USDT', ms=NOW + 100)
+    old = trade(order_id='78', tid='902', pair='BTC_USDT', ms=NOW - 10_000)       # before the campaign
+    assert store.quarantine_external_trades([foreign, old], NOW + 200) == 1
+    assert store.external_activity()['reason'] == 'FOREIGN_FILL'
+    [evidence] = store.external_fills()
+    assert evidence['trade_id'] == '901' and evidence['raw']['canonical']['currency_pair'] == 'BTC_USDT'
+    assert store.fills() == [] and store.position().qty == 0
+    assert store.quarantine_external_trades([foreign], NOW + 300) == 1          # idempotent
+    assert len(store.external_fills()) == 1
+
+
 def test_amend_qty_rules_and_clear(store):
     row = reserve(store, qty='10', price='2', order_id='1')
     rec(store, [trade(qty='4')])

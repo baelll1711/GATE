@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS orders(
     amend_state TEXT CHECK(amend_state IS NULL OR amend_state IN ('sent','unknown')),
     amend_price TEXT, amend_qty TEXT, amend_text TEXT, amend_sent_ms INTEGER,
     prior_prices TEXT NOT NULL DEFAULT '[]',
-    diagnostics TEXT);
+    diagnostics TEXT,
+    sent_ms INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_slot ON orders(side, level) WHERE state IN {_ACTIVE_SQL};
 CREATE INDEX IF NOT EXISTS orders_state ON orders(state);
 CREATE INDEX IF NOT EXISTS orders_created ON orders(created_ms);
@@ -197,6 +198,13 @@ def utc_text(ms: int) -> str:
     return datetime.fromtimestamp(int(ms) / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
 
+def prior_prices_since(prior_prices: Any, since_ms: int) -> set[Decimal]:
+    """Previous prices of an amended order (``orders.prior_prices``: JSON text or parsed
+    ``[(price, until_ms)]``) that it left at or after ``since_ms``."""
+    entries = json.loads(prior_prices) if isinstance(prior_prices, str) else (prior_prices or ())
+    return {D(price) for price, until in entries if int(until) >= int(since_ms)}
+
+
 def fill_key_for(currency_pair: str, order_id: str, trade_id: str, create_time_ms: int) -> str:
     """sha256 of the JSON identity ``[pair, order_id, trade_id, create_time_ms]``."""
     data = json.dumps([currency_pair, order_id, trade_id, int(create_time_ms)], separators=(',', ':'))
@@ -231,10 +239,22 @@ class Store:
                 raise Unsafe('SQLITE_WAL_UNAVAILABLE')
             self.db.execute('PRAGMA synchronous=FULL')
             self.db.executescript(SCHEMA)
+            self._migrate()
         except BaseException:
             self.db.close()
             raise
         self._last_components_ms: int | None = None
+
+    def _migrate(self) -> None:
+        """Additive, idempotent column migrations of databases created by older versions.
+
+        ``orders.sent_ms`` (wall-clock time stamped right before the create request that
+        carries the row was sent): NULL for rows written before the column existed; the
+        unknown-create expiry then falls back to ``created_ms`` exactly as before.
+        """
+        columns = {row[1] for row in self.db.execute('PRAGMA table_info(orders)')}
+        if 'sent_ms' not in columns:
+            self.db.execute('ALTER TABLE orders ADD COLUMN sent_ms INTEGER')
 
     # ----- transactions -----
     @contextmanager
@@ -482,6 +502,24 @@ class Store:
                             ('rejected' if rejected else 'closed', status, finish_as, now_ms, now_ms, text))
             self.db.execute('DELETE FROM meta WHERE key=?', ('terminal_fp:' + text,))
 
+    def mark_sent(self, texts: Sequence[str], now_ms: int) -> None:
+        """Stamp ``sent_ms`` on reserved rows right BEFORE the create request carrying them
+        is sent (one transaction per request). The unknown-create expiry is measured from
+        this stamp: the request is signed after it, so its x-gate-exptime is never earlier
+        than ``sent_ms + request_expiry``. Only still-unsent ``reserved`` rows qualify."""
+        now_ms = _integer(now_ms, 'now_ms')
+        texts = list(texts)
+        if not texts or any(not isinstance(text, str) or not text for text in texts) or len(set(texts)) != len(texts):
+            raise ValueError('Invalid order texts')
+        with self._write():
+            for text in texts:
+                row = self.db.execute('SELECT state,sent_ms FROM orders WHERE text=?', (text,)).fetchone()
+                if row is None:
+                    raise Unsafe('MISSING_LOCAL_ORDER')
+                if row['state'] != 'reserved' or row['sent_ms'] is not None:
+                    raise Unsafe('ORDER_ALREADY_SENT')
+                self.db.execute('UPDATE orders SET sent_ms=? WHERE text=?', (now_ms, text))
+
     def set_order_diagnostics(self, text: str, data: dict) -> None:
         encoded = _dumps(data)
         with self._write():
@@ -559,19 +597,23 @@ class Store:
     def own_levels(self, side: str, snapshot_ms: int) -> dict[Decimal, Decimal]:
         """{price: ORIGINAL qty} of own active orders plus closed (not rejected) orders whose
         first terminal observation is within 2 s of the book snapshot. An order with an
-        unresolved amend is counted at both prices (conservative own-volume exclusion)."""
+        unresolved amend is counted at both prices, and an amended order also at every
+        previous price it left within 2 s of the snapshot (book lag; conservative own-volume
+        exclusion)."""
         snapshot_ms = _integer(snapshot_ms, 'snapshot_ms')
+        since = snapshot_ms - OWN_LEVEL_GRACE_MS
         with self.lock:
             rows = self.db.execute(
-                f'SELECT price,qty,amend_state,amend_price FROM orders WHERE side=? AND '
+                f'SELECT price,qty,amend_state,amend_price,prior_prices FROM orders WHERE side=? AND '
                 f"(state IN {_ACTIVE_SQL} OR (state='closed' AND terminal_since_ms>=?))",
-                (side, snapshot_ms - OWN_LEVEL_GRACE_MS)).fetchall()
+                (side, since)).fetchall()
         result: dict[Decimal, Decimal] = {}
         for row in rows:
             qty = D(row['qty'])
             prices = {D(row['price'])}
             if row['amend_state'] in AMEND_PENDING and row['amend_price'] is not None:
                 prices.add(D(row['amend_price']))
+            prices.update(prior_prices_since(row['prior_prices'], since))
             for price in prices:
                 result[price] = result.get(price, ZERO) + qty
         return result
@@ -830,6 +872,28 @@ class Store:
                                 sort_keys=True)))
         self.db.execute('INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)',
                         ('external_activity', _dumps({'reason': 'FOREIGN_FILL', 'detected_ms': now_ms})))
+
+    def quarantine_external_trades(self, trades: Sequence[VenueTrade], now_ms: int) -> int:
+        """Executions on OTHER pairs of the account (account-wide check, never own): kept in
+        ``external_fills`` as evidence with meta ``external_activity`` FOREIGN_FILL, in ONE
+        transaction. Trades older than ``start_ms - 2 s`` are pre-campaign and ignored.
+        Returns the number of campaign-time trades (new or already quarantined)."""
+        now_ms = _integer(now_ms, 'now_ms')
+        trades = list(trades)
+        count = 0
+        with self._write():
+            self._require_identity()
+            start = self.meta('start_ms')
+            if start is None:
+                raise Unsafe('DATABASE_NOT_INITIALIZED')
+            start = _integer(start, 'start_ms')
+            for trade in trades:
+                fill = self._parse_trade(trade)
+                if fill['time_ms'] < start - FOREIGN_GRACE_MS:
+                    continue
+                self._quarantine_external_fill(fill, trade, now_ms)
+                count += 1
+        return count
 
     def record_trades(self, trades: Sequence[VenueTrade], *, base: str, quote: str, now_ms: int,
                       start_ms: int | None = None, quarantine_foreign: bool = False,

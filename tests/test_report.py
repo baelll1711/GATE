@@ -23,7 +23,7 @@ import pytest
 from gate_stonk.report import build_report, distribution, edge_pct, format_report_ru
 from gate_stonk.status import dumps
 from gate_stonk.store import Store, fill_key_for
-from gate_stonk.types import VenueTrade
+from gate_stonk.types import VenueOrder, VenueTrade
 
 D = Decimal
 H = 3_600_000
@@ -195,8 +195,9 @@ def test_per_slot_metrics_match_hand_computation(store, campaign):
     assert b1['orders_with_fills'] == 1 and b1['fill_ratio_pct'] == D(50)
     assert b1['fills'] == 2 and b1['filled_qty'] == D(2) and b1['filled_notional_usdt'] == D(198)
     assert b1['avg_fill_price'] == D(99)
-    assert b1['avg_edge_at_placement_pct'] == (buy_edge(100, 99) + buy_edge('99.5', '98.5')) / 2
-    assert b1['avg_edge_of_fills_vs_placement_index_pct'] == D(1)
+    assert b1['avg_edge_at_placement_vs_index_pct'] == (buy_edge(100, 99) + buy_edge('99.5', '98.5')) / 2
+    assert b1['avg_edge_at_placement_vs_center_pct'] == b1['avg_edge_at_placement_vs_index_pct']   # index = centre
+    assert b1['avg_edge_of_fills_vs_placement_index_pct'] == D(1) == b1['avg_edge_of_fills_vs_placement_center_pct']
     # F1: engine mark 100; F2: computed from samples 19 800 (100.2, 200 ms before) / 20 300 (300 ms after)
     assert b1['fills_with_index_at_fill'] == 2
     assert b1['avg_edge_of_fills_vs_index_at_fill_pct'] == weighted([(buy_edge(100, 99), D(1)),
@@ -216,7 +217,8 @@ def test_per_slot_metrics_match_hand_computation(store, campaign):
     b2 = report['slots']['buy:b2']
     assert (b2['orders'], b2['orders_with_fills'], b2['fill_ratio_pct'], b2['fills']) == (1, 1, D(100), 1)
     assert (b2['filled_qty'], b2['filled_notional_usdt'], b2['avg_fill_price']) == (D(1), D(98), D(98))
-    assert b2['avg_edge_at_placement_pct'] == D(2) == b2['avg_edge_of_fills_vs_placement_index_pct']
+    assert b2['avg_edge_at_placement_vs_index_pct'] == D(2) == b2['avg_edge_of_fills_vs_placement_index_pct']
+    assert b2['avg_edge_at_placement_vs_center_pct'] == D(2) == b2['avg_edge_of_fills_vs_placement_center_pct']
     assert b2['avg_edge_of_fills_vs_index_at_fill_pct'] is None and b2['fills_with_index_at_fill'] == 0
     assert b2['markout_5s_pct'] == buy_edge('100.2', 98)     # +20 000 -> 100.2
     assert b2['markout_30s_pct'] == buy_edge(102, 98)        # +45 000 -> exact sample 102
@@ -228,7 +230,8 @@ def test_per_slot_metrics_match_hand_computation(store, campaign):
     s1 = report['slots']['sell:s1']
     assert (s1['orders'], s1['orders_with_fills'], s1['fill_ratio_pct'], s1['fills']) == (1, 1, D(100), 1)
     assert (s1['filled_qty'], s1['filled_notional_usdt'], s1['avg_fill_price']) == (D('1.5'), D('151.5'), D(101))
-    assert s1['avg_edge_at_placement_pct'] == D(1) == s1['avg_edge_of_fills_vs_placement_index_pct']
+    assert s1['avg_edge_at_placement_vs_index_pct'] == D(1) == s1['avg_edge_of_fills_vs_placement_index_pct']
+    assert s1['avg_edge_at_placement_vs_center_pct'] == D(1) == s1['avg_edge_of_fills_vs_placement_center_pct']
     assert s1['avg_edge_of_fills_vs_index_at_fill_pct'] == sell_edge('100.5', 101)   # engine mark wins
     assert s1['markout_5s_pct'] == D(1)          # +30 000: tie 29 500 / 30 500 -> earlier sample 100.0
     assert s1['markout_30s_pct'] is None and s1['markout_60s_pct'] is None
@@ -241,8 +244,10 @@ def test_per_slot_metrics_match_hand_computation(store, campaign):
     assert s1['window_unmatched_sold_qty'] == D(0) and s1['window_has_unknown_cost_sales'] is False
 
     s2 = report['slots']['sell:s2']
-    assert s2['avg_edge_at_placement_pct'] == sell_edge('100.5', 103)        # center, not index_price
-    assert s2['avg_edge_of_fills_vs_placement_index_pct'] == sell_edge('100.5', 103)
+    assert s2['avg_edge_at_placement_vs_index_pct'] == sell_edge('100.4', 103)       # order.index_price
+    assert s2['avg_edge_of_fills_vs_placement_index_pct'] == sell_edge('100.4', 103)
+    assert s2['avg_edge_at_placement_vs_center_pct'] == sell_edge('100.5', 103)      # order.center_price
+    assert s2['avg_edge_of_fills_vs_placement_center_pct'] == sell_edge('100.5', 103)
     assert s2['avg_edge_of_fills_vs_index_at_fill_pct'] == sell_edge(102, 103)
     assert s2['fills_with_markout_5s'] == 0 and s2['markout_5s_pct'] is None
     assert s2['median_rest_seconds'] == D(42)
@@ -403,6 +408,8 @@ def test_report_is_json_safe_and_russian_text(store, campaign):
     assert lines[0] == ("Отчёт paper 'rep' (STONK_USDT) за 1 ч (2027-01-15 07:00:00 UTC — 2027-01-15 08:00:00 UTC).")
     header = next(line for line in lines if line.startswith('Слот'))
     assert 'Fill,%' in header and 'Исп./индекс,% (n)' in header and '60 с,%' in header
+    assert 'Выст./инд.,%' in header and 'Исп./инд. выст.,%' in header
+    assert 'Выст./центр,%' in header and 'Исп./центр,%' in header
     row = next(line for line in lines if line.startswith('buy:b1'))
     cells = [c.strip() for c in row.split('|')]
     assert cells[:8] == ['buy:b1', '2', '1', '50', '2', '2', '198.00', '99']
@@ -427,6 +434,7 @@ def test_empty_store_report(store):
     assert report['index']['blocked_index_time_pct'] is None and report['basis']['count'] == 0
     text = format_report_ru(report)
     assert 'Базис: нет наблюдений со спот-стаканом.' in text and 'Правила выставления: нет заявок.' in text
+    assert report['order_rebates']['orders'] == 0 and 'Rebate по заявкам (rebated_fee): нет.' in text
     json.loads(dumps(report))
 
 
@@ -475,4 +483,100 @@ def test_edge_at_placement_uses_the_creation_price_of_an_amended_order(store):
     store.confirm_amend('t-stk1-b1-amd1', T0 + 5000)
     assert store.order('t-stk1-b1-amd1')['price'] == D('99.6')
     report = build_report(store, hours=1, now_ms=NOW)
-    assert report['slots']['buy:b1']['avg_edge_at_placement_pct'] == buy_edge('100', '99') == D(1)
+    b1 = report['slots']['buy:b1']
+    assert b1['avg_edge_at_placement_vs_center_pct'] == buy_edge('100', '99') == D(1)
+    assert b1['avg_edge_at_placement_vs_index_pct'] == D(1)
+
+
+def test_edge_metrics_use_one_reference_per_family_with_a_basis_offset(store):
+    """Regression: with basis_offset_pct -0.5 (centre = index * 0.995) placement edges were
+    measured to the centre while at-fill marks and markouts used the index, so a fill
+    with an unmoved index looked 0.5 % better than placement. The index family is now
+    consistent; the centre-based values keep their own *_vs_center names."""
+    store.reserve_order(text='t-stk1-b1-bas1', side='buy', level='b1', qty=D('1'), price=D('1.9701'),
+                        now_ms=T0 + 1000, reason='FIXED_EDGE', index_price=D('2.00'), center_price=D('1.99'))
+    store.update_order('t-stk1-b1-bas1', order_id='601', state='open')
+    store.record_trades([trade('61', '601', 'buy', '1', '1.9701', '0', 'USDT', T0 + 2000)], base='STONK',
+                        quote='USDT', now_ms=NOW)
+    fk = key('601', '61', T0 + 2000)
+    store.record_marks([(fk, 0, D('2.00'), T0 + 2000), (fk, 60, D('2.00'), T0 + 62_000)])
+    b1 = build_report(store, hours=1, now_ms=NOW)['slots']['buy:b1']
+    on_index = buy_edge('2.00', '1.9701')
+    assert on_index == D('1.495')
+    assert b1['avg_edge_at_placement_vs_index_pct'] == on_index
+    assert b1['avg_edge_of_fills_vs_placement_index_pct'] == on_index == b1['avg_edge_of_fills_vs_index_at_fill_pct']
+    assert b1['markout_60s_pct'] == on_index                       # index did not move: no fake improvement
+    assert b1['avg_edge_at_placement_vs_center_pct'] == buy_edge('1.99', '1.9701') == D(1)
+    assert b1['avg_edge_of_fills_vs_placement_center_pct'] == D(1)
+
+
+def _rebate_order(order_id, text, side, amount, currency='USDT'):
+    return VenueOrder(order_id=order_id, text=text, currency_pair=PAIR, side=side, type='limit', account='spot',
+                      time_in_force='poc', price=D(1), amount=D(1), left=D(0), filled_amount=D(1), iceberg=D(0),
+                      status='closed', finish_as='filled', create_time_ms=T0, update_time_ms=T0,
+                      rebated_fee=D(amount), rebated_fee_currency=currency)
+
+
+def test_order_rebates_are_reported_per_currency_and_slot(store):
+    """Regression: the order-level rebated_fee was written to order_rebates but never read
+    by the report. It is listed (campaign, window, per slot) and a separately labelled
+    realized-including-rebate figure is shown; the ledger realized is unchanged."""
+    c = Campaign(store)
+    c.order('O1', 'buy', 'b1', '1', '2', T0 + 1000, '2.02', order_id='701')
+    c.fill('F1', '71', '701', 'buy', '1', '2', '0.002', 'USDT', T0 + 2000)
+    c.order('O2', 'sell', 's1', '1', '3', T0 + 3000, '2.97', order_id='702')
+    c.fill('F2', '72', '702', 'sell', '1', '3', '0.003', 'USDT', T0 + 4000)
+    c.order('O0', 'sell', 's2', '1', '3', T0 - 600_000, '2.97', order_id='700')     # before the window
+    store.record_order_rebate(_rebate_order('702', c.texts['O2'], 'sell', '0.5'), T0 + 5000)
+    store.record_order_rebate(_rebate_order('701', c.texts['O1'], 'buy', '0.25'), T0 + 5000)
+    store.record_order_rebate(_rebate_order('701', c.texts['O1'], 'buy', '0.2'), T0 + 6000)   # latest wins
+    store.record_order_rebate(_rebate_order('700', c.texts['O0'], 'sell', '1', 'STONK'), T0 + 7000)
+    report = build_report(store, hours=1, now_ms=NOW)
+    realized = D('2.997') - D('2.002')
+    assert report['totals']['realized_usdt'] == realized == report['position']['realized_usdt']   # ledger untouched
+    rebates = report['order_rebates']
+    assert rebates['in_ledger'] is False and rebates['orders'] == 3 and rebates['orders_in_window'] == 2
+    assert rebates['campaign'] == {'STONK': D(1), 'USDT': D('0.7')}
+    assert rebates['window'] == {'USDT': D('0.7')}
+    assert rebates['by_slot'] == {'buy:b1': {'USDT': D('0.2')}, 'sell:s1': {'USDT': D('0.5')}}
+    assert rebates['realized_incl_quote_rebates_usdt'] == realized + D('0.7')
+    text = format_report_ru(report)
+    assert ('Rebate по заявкам (rebated_fee, уменьшает затраты; в себестоимость и «Реализовано» выше не входит): '
+            'за окно USDT 0.7 (buy:b1: USDT 0.2; sell:s1: USDT 0.5); за кампанию STONK 1; USDT 0.7.') in text
+    assert f"Реализовано за кампанию с учётом rebate в USDT: {signed_text(realized + D('0.7'))} USDT." in text
+    json.loads(dumps(report))
+    earlier = build_report(store, hours=1, now_ms=T0 - 1)           # only O0 (by created_ms) in this window
+    assert earlier['order_rebates']['by_slot'] == {'sell:s2': {'STONK': D(1)}}
+    assert 'за окно STONK 1 (sell:s2: STONK 1); за кампанию STONK 1; USDT 0.7.' in format_report_ru(earlier)
+    before = build_report(store, hours=1, now_ms=T0 - 700_000)       # window before any rebated order
+    assert before['order_rebates']['window'] == {} and before['order_rebates']['by_slot'] == {}
+    assert 'за окно нет; за кампанию STONK 1; USDT 0.7.' in format_report_ru(before)
+
+
+def signed_text(value):
+    from gate_stonk.ledger import signed
+    return signed(value)
+
+
+def test_paper_report_states_its_limitations(store, tmp_path):
+    """Regression (prompt §4): a paper report must say that the queue and the hidden iceberg
+    part's priority are not modelled; a live report does not carry that line."""
+    store.reserve_order(text='t-stk1-b2-ice1', side='buy', level='b2', qty=D('10'), price=D('99'), now_ms=T0 + 1000,
+                        reason='FIXED_EDGE', index_price=D('100'), center_price=D('100'), iceberg=D('2.5'))
+    store.reserve_order(text='t-stk1-b1-pln1', side='buy', level='b1', qty=D('1'), price=D('99'), now_ms=T0 + 1000,
+                        reason='FIXED_EDGE', index_price=D('100'), center_price=D('100'))
+    report = build_report(store, hours=1, now_ms=NOW)
+    assert report['mode'] == 'paper' and 'queue' in report['limitations'] and 'iceberg' in report['limitations']
+    assert report['iceberg_slots'] == ['buy:b2']
+    text = format_report_ru(report)
+    assert text.splitlines()[1].startswith('Ограничения paper: очередь на уровне цены и приоритет/taker-комиссия '
+                                           'скрытой части iceberg не моделируются')
+    assert 'Iceberg-слоты в окне: buy:b2' in text
+    live = Store(tmp_path / 'live.sqlite3')
+    try:
+        live.initialize(dict(IDENTITY, mode='live'), START)
+        live_report = build_report(live, hours=1, now_ms=NOW)
+        assert live_report['limitations'] is None
+        assert 'Ограничения paper' not in format_report_ru(live_report)
+    finally:
+        live.close()

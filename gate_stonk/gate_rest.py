@@ -6,6 +6,12 @@ Transport discipline ported from the reference (zec_spot/transport.py, spot_port
   validation, missing keys, the read checkpoint, the rate limiter, the local clock
   guard) fails before anything is signed or sent: ``NotSent`` (or ``BudgetWait`` /
   ``ReadInterrupted``, which also prove that nothing was sent).
+* Local clock guard: Gate has no nonce (only a ``Timestamp`` with a +-60 s window), so a
+  wall clock that stepped BACKWARDS below the last signed request refuses (NotSent) only
+  the non-emergency writes that CREATE or AMEND orders, where NotSent is safe. Cancels,
+  the DMS countdown and reads are still sent (refusing them would delay protective
+  cancels); the step is recorded in ``diagnostics()['clock_backwards']`` and logged.
+  Larger skew is caught by the periodic ``/spot/time`` check (``max_clock_skew_ms``).
 * After the request may have left: only an explicit Gate refusal (a 4xx with a JSON
   ``label``) is ``Rejected``. Timeouts, connection errors, 5xx, ``INTERNAL`` /
   ``SERVER_ERROR`` / ``TOO_BUSY``, unlabelled errors and non-JSON replies are
@@ -156,6 +162,7 @@ class _Prepared:
     expire: bool
     signed: bool
     write: bool
+    order_write: bool       # creates or amends an order (ORDER bucket endpoint)
 
 
 class GateRestClient:
@@ -194,7 +201,8 @@ class GateRestClient:
         self._lock = threading.Lock()
         self._last_signed_ms = 0
         self._diag_lock = threading.Lock()
-        self._diag: dict[str, Any] = {'requests': 0, 'outcomes': {}, 'last_error': None, 'rate_limit_headers': {}}
+        self._diag: dict[str, Any] = {'requests': 0, 'outcomes': {}, 'last_error': None, 'rate_limit_headers': {},
+                                      'clock_backwards': {'count': 0, 'last': None}}
 
     # ------------------------------------------------------------------ construction helpers
     @classmethod
@@ -254,6 +262,9 @@ class GateRestClient:
                 'last_error': dict(self._diag['last_error']) if self._diag['last_error'] else None,
                 'rate_limit_headers': {k: dict(v) for k, v in self._diag['rate_limit_headers'].items()},
                 'last_signed_ms': self._last_signed_ms,
+                'clock_backwards': {'count': self._diag['clock_backwards']['count'],
+                                    'last': (dict(self._diag['clock_backwards']['last'])
+                                             if self._diag['clock_backwards']['last'] else None)},
             }
 
     # ------------------------------------------------------------------ internals
@@ -291,10 +302,11 @@ class GateRestClient:
         if expire is not None and bool(expire) != needs_exptime:
             raise ValueError('x-gate-exptime policy mismatch for this endpoint')
         url = self._origin + API_PREFIX + path + ('?' + query if query else '')
+        order_write = write and default_bucket(method, path) == ORDER
         return _Prepared(method=method, path=path, group=endpoint_group(path), url=url,
                          sign_path=API_PREFIX + path, sign_query=unquote_plus(query), payload=payload,
                          bucket=bucket, emergency=bool(emergency), expire=needs_exptime, signed=signed,
-                         write=write)
+                         write=write, order_write=order_write)
 
     @staticmethod
     def _encode_params(params: Any) -> str:
@@ -344,9 +356,13 @@ class GateRestClient:
             now = time.time()
             now_ms = int(now * 1000)
             if prepared.signed:
-                if self.clock_guard and now_ms < self._last_signed_ms:
-                    self._note(prepared, 'not_sent', error='LOCAL_CLOCK_MOVED_BACKWARDS')
-                    raise NotSentUnsafe('LOCAL_CLOCK_MOVED_BACKWARDS')
+                if now_ms < self._last_signed_ms:
+                    # Gate has no nonce: only a create/amend is refused (NotSent is safe there);
+                    # cancels, DMS renewals and reads go out, the step is diagnostic only.
+                    if self.clock_guard and prepared.order_write and not prepared.emergency:
+                        self._note(prepared, 'not_sent', error='LOCAL_CLOCK_MOVED_BACKWARDS')
+                        raise NotSentUnsafe('LOCAL_CLOCK_MOVED_BACKWARDS')
+                    self._note_clock_backwards(prepared, self._last_signed_ms - now_ms)
                 self._last_signed_ms = max(self._last_signed_ms, now_ms)
                 headers.update(self._sign_headers(prepared, now))
             if prepared.expire:
@@ -461,6 +477,21 @@ class GateRestClient:
                 self.limiter.record_headers(bucket, info)
         except Exception:
             pass  # diagnostics never change a trading result
+
+    def _note_clock_backwards(self, prepared: _Prepared, behind_ms: int) -> None:
+        """Diagnostic only: a cancel / DMS / read signed while the wall clock is behind the
+        last signed request (Gate has no nonce, so the request is still sent)."""
+        try:
+            with self._diag_lock:
+                entry = self._diag['clock_backwards']
+                entry['count'] += 1
+                entry['last'] = {'endpoint': f'{prepared.method} {prepared.group}', 'behind_ms': int(behind_ms),
+                                 'at_ms': int(time.time() * 1000)}
+            LOG.warning('REST %s %s: local clock is %s ms behind the last signed request '
+                        '(LOCAL_CLOCK_MOVED_BACKWARDS); sent anyway (cancel/DMS/read)',
+                        prepared.method, prepared.group, behind_ms)
+        except Exception:
+            pass
 
     def _note(self, prepared: _Prepared, outcome: str, *, status: int | None = None, label: str | None = None,
               error: str | None = None, started: float | None = None) -> None:

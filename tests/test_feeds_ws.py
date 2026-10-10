@@ -446,6 +446,34 @@ def test_worker_reconnects_after_sustained_stale_messages_through_the_hub(clock)
     assert len(hub.quote_health.reconnects['src']) == 1
 
 
+def test_stale_ws_frames_older_than_a_rest_snapshot_neither_wipe_it_nor_force_reconnects(clock):
+    """The REST refresher keeps the key fresh while the socket keeps delivering old
+    snapshots: the frames are dropped as out of order, the REST book survives, and the
+    stale-stream reconnect policy (which would invalidate the key) is never triggered."""
+    hub = FeedHub(HubConfig(), start_threads=False)
+    rest_books: list[Book] = []
+    observed = []
+
+    def rest_then_stale():
+        clock[0] += 2
+        rest = make_book(clock[0], int(clock[0] * 1000))
+        hub.publish(Update('book', 'src', book=rest, source='rest'))
+        rest_books.append(rest)
+        return 'book:10000'                           # event time 10 s old at receipt
+
+    def inspect():
+        snap = hub.source_snapshot('src')
+        observed.append((snap.book is rest_books[-1], snap.error))
+        return ''
+    conn = FakeConn([rest_then_stale] * 10 + [inspect], clock)
+    harness = Harness(FakeAdapter('src'), hub, [conn], clock)
+    harness.run()
+    assert harness.reasons[0] == 'WEBSOCKET_CLOSED'   # not STALE_STREAM_RECONNECT
+    assert observed == [(True, None)]
+    assert hub._counters['src']['dropped_out_of_order'] == 10 and hub._counters['src']['rejected'] == 0
+    assert hub.quote_health.reconnects.get('src') is None
+
+
 def test_worker_bad_data_invalidates_only_its_key_and_disconnect_drops_the_book(clock):
     hub = FeedHub(HubConfig(), start_threads=False)
     hub.publish(Update('book', 'other', book=make_book(clock[0], int(clock[0] * 1000))))

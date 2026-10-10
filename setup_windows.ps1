@@ -3,6 +3,8 @@
 param([string]$Config = "config.yaml")
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+# Вывод Python в UTF-8 (русский текст не должен ломаться при перенаправлении вывода).
+$env:PYTHONUTF8 = "1"
 
 if (-not (Test-Path ".venv\Scripts\python.exe")) {
     py -3.12 -m venv .venv

@@ -71,6 +71,148 @@ def test_unknown_create_absent_cancels_healthy_slots_too(tmp_path, clock):
     assert rig.venue.orders[rows['b2']['order_id']].status == 'cancelled'
 
 
+SEQUENTIAL = {'execution.use_batch': False}
+
+
+def test_sequential_create_stops_at_first_unknown_and_releases_unsent(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000', base='1000', overrides=SEQUENTIAL)
+    rig.venue.place_plan.append('lost_before')
+    assert rig.step() == 'UNKNOWN_CREATE_RESULT'
+    assert len(rig.venue.place_log) == 1                         # nothing sent after the unknown
+    [unknown] = rig.rows()
+    assert unknown['text'] == rig.venue.place_log[0].text and unknown['state'] == 'unknown'
+    assert unknown['sent_ms'] == int(clock[0] * 1000)
+    unsent = [r for r in rig.rows(active=False) if r['state'] == 'rejected']
+    assert len(unsent) == 3 and all(r['sent_ms'] is None for r in unsent)   # provably never sent
+    assert all(rig.engine.slot_states[r['slot']] == 'NOT_SENT:UNKNOWN_CREATE_STOP' for r in unsent)
+    rig.status_json()
+
+
+def test_unknown_create_expiry_counts_from_send_not_reservation(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=SEQUENTIAL)
+    t0 = clock[0]
+    rig.venue.place_plan.extend([None, 'lost_before'])
+    rig.venue.on_place = lambda req: rig.advance(20) if '-b1-' in req.text else None   # a slow first POST
+    assert rig.step() == 'UNKNOWN_CREATE_RESULT'
+    lost = rig.row('buy:b2')
+    assert lost['state'] == 'unknown' and lost['created_ms'] == int(t0 * 1000)
+    assert lost['sent_ms'] == int((t0 + 20) * 1000)               # signed 20 s after its reservation
+    # expiry = 10 + 2 * 5 + 30 = 50 s after the SEND (t0 + 70), not after the reservation (t0 + 50)
+    while clock[0] < t0 + 66:
+        assert rig.step(5).startswith('UNKNOWN_ORDER_KEEP_RESERVATION:' + lost['text'])
+        assert rig.store.order(lost['text'])['terminal_status'] is None
+    rig.advance(t0 + 71 - clock[0])
+    rig.step()
+    assert rig.store.order(lost['text'])['terminal_status'] == 'rejected'
+
+
+def test_unknown_create_expiry_ignores_forward_wall_clock_jump(tmp_path, clock, monkeypatch):
+    jump = [0.0]
+    monkeypatch.setattr('time.time', lambda: clock[0] + jump[0])      # wall clock only; monotonic unchanged
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides={'pair.buy.levels': [B1], 'pair.mode': 'buy'})
+    rig.venue.place_plan.append('lost_before')
+    assert rig.step() == 'UNKNOWN_CREATE_RESULT'
+    [row] = rig.rows()
+    jump[0] = 120.0
+    assert rig.step(1).startswith('UNKNOWN_ORDER_KEEP_RESERVATION:' + row['text'])
+    assert rig.store.order(row['text'])['terminal_status'] is None   # not released by the jump alone
+    # After a restart only the wall clock is known: the persisted sent_ms decides.
+    engine2 = Engine(rig.cfg, rig.store, rig.venue, rig.hub, IndexBuilder(rig.cfg.index_settings()),
+                     FakeNotifier(), live=False, meta=rig.venue.meta)
+    assert engine2._create_expired(rig.store.order(row['text'])) is True
+    rig.step(50)                                                  # monotonic time covers the window too
+    assert rig.store.order(row['text'])['terminal_status'] == 'rejected'
+
+
+def test_sequential_create_rechecks_dms_margin_before_each_send(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=SEQUENTIAL)
+    rig.venue.on_place = lambda req: rig.advance(30)              # DMS armed for 45 s; 15 s left after it
+    assert rig.step() == 'RUNNING'
+    assert len(rig.venue.place_log) == 1
+    sent = rig.store.order(rig.venue.place_log[0].text)
+    assert sent['state'] == 'open' and rig.row('buy:b2') is None
+    [skipped] = [r for r in rig.rows(active=False) if r['state'] == 'rejected']
+    assert skipped['slot'] == 'buy:b2' and skipped['sent_ms'] is None
+    assert rig.engine.slot_states['buy:b2'] == 'NOT_SENT:DMS_TOO_CLOSE_FOR_CREATE'
+
+
+def test_batch_create_stops_after_an_unknown_chunk(tmp_path, clock):
+    buys = [{'id': f'b{i}', 'edge_pct': 1.0 + 0.5 * i, 'order_notional_usdt': 5} for i in range(1, 7)]
+    sells = [{'id': f's{i}', 'edge_pct': 1.0 + 0.5 * i, 'order_notional_usdt': 5} for i in range(1, 7)]
+    overrides = {'pair.buy.levels': buys, 'pair.sell.levels': sells, 'safety.max_open_orders': 12}
+    rig = make_rig(tmp_path, clock, usdt='1000', base='1000', overrides=overrides)
+    rig.venue.batch_plan.append('raise_unknown')
+    assert rig.step() == 'UNKNOWN_CREATE_RESULT'
+    [chunk] = rig.venue.batch_log                                 # the second chunk is never sent
+    assert len(chunk) == 10
+    assert {r['text'] for r in rig.rows()} == {r.text for r in chunk}
+    unsent = [r for r in rig.rows(active=False) if r['state'] == 'rejected']
+    assert len(unsent) == 2 and all(r['sent_ms'] is None for r in unsent)
+    assert all(r['sent_ms'] == int(clock[0] * 1000) for r in rig.rows())
+
+
+@pytest.mark.parametrize('settlement', [False, True])
+def test_control_read_binds_unbound_terminal_row_by_text(tmp_path, clock, settlement):
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides={'pair.buy.levels': [B1], 'pair.mode': 'buy'})
+    t0 = clock[0]
+    rig.venue.place_plan.append('lost_before')
+    assert rig.step() == 'UNKNOWN_CREATE_RESULT'
+    [row] = rig.rows()
+    if settlement:
+        rig.stop_file('STOP_TRADING')
+    rig.advance(t0 + 51 - clock[0])
+    rig.step()
+    assert rig.store.order(row['text'])['terminal_status'] == 'rejected'      # no trace after the window
+    # The delayed request is accepted mid-pass: after (A), before the control read (G).
+    late = rig.venue.place_log[0]
+    rig.venue.read_hooks['my_trades'] = lambda: rig.venue._create(late)
+    assert rig.step(2.5) == 'WAIT_ACCOUNT_RECONCILIATION'          # TERMINAL_ORDER_STILL_OPEN
+    exchange = rig.venue.by_text(row['text'])
+    after = rig.store.order(row['text'])
+    assert after['order_id'] == exchange.order_id and after['terminal_status'] is None
+    assert after['state'] not in ('rejected', 'closed')                       # reservation kept
+    assert rig.store.external_activity() is None                              # own order, not foreign
+    if settlement:
+        rig.settle(dt=2.5)
+        for _ in range(4):
+            rig.step(2.5)
+        final = rig.store.order(row['text'])
+        assert final['state'] == 'closed' and final['terminal_status'] == 'cancelled'
+        assert exchange.status == 'cancelled'
+    else:
+        rig.step(2.5)                     # now an ordinary own order (the expired DMS gets it cancelled)
+        assert rig.store.order(row['text'])['order_id'] == exchange.order_id
+        assert rig.store.order(row['text'])['state'] in ('open', 'cancel_pending')
+        assert [o.text for o in rig.venue.own_open()] in ([], [row['text']])   # never a duplicate for the slot
+    assert rig.store.external_activity() is None
+
+
+class _RateLimiter:
+    """Order bucket full once ``full`` is set (engine pre-checks only)."""
+
+    def __init__(self):
+        self.full = False
+
+    def wait(self, bucket, cost=1):
+        return 1.0 if self.full and bucket == 'order' else 0.0
+
+    def rate_limited(self, bucket):
+        pass
+
+    def status(self):
+        return {}
+
+
+def test_sequential_create_rechecks_order_rate_before_each_send(tmp_path, clock):
+    limiter = _RateLimiter()
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=SEQUENTIAL, limiter=limiter)
+    rig.venue.on_place = lambda req: setattr(limiter, 'full', True)
+    assert rig.step() == 'RUNNING'
+    assert len(rig.venue.place_log) == 1 and rig.row('buy:b2') is None
+    assert rig.engine.slot_states['buy:b2'] == 'ORDER_RATE_WAIT'
+    assert 'buy:b2' not in rig.engine._reject_backoff and rig.engine.counters['rejects'] == 0
+
+
 # ---------------------------------------------------------------- post-only
 def test_post_only_rejection_label_backoff_schedule(tmp_path, clock):
     rig = make_rig(tmp_path, clock, usdt='1000')
@@ -192,6 +334,49 @@ def test_fill_while_cancel_pending_is_accounted_before_release(tmp_path, clock):
     assert closed['terminal_status'] == 'cancelled'
 
 
+# ---------------------------------------------------------------- withdrawals
+BUY_ONLY = {'pair.mode': 'buy'}
+
+
+def _buy_filled(rig, slot):
+    row = rig.row(slot)
+    rig.venue.fill(row['order_id'], row['qty'])
+    rig.step(1)
+    rig.settle()
+    return row
+
+
+def test_clean_withdrawal_is_booked_at_average_cost(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=BUY_ONLY)
+    rig.step()
+    _buy_filled(rig, 'buy:b1')
+    before = rig.store.position()
+    assert before.qty > 0 and rig.store.meta('ledger_clean')['fills'] == 1
+    rig.venue.funds['STONK'] -= before.qty                       # the operator withdraws the bot's tokens
+    rig.step(2.5)
+    rig.step(2.5)
+    after = rig.store.position()
+    assert after.qty == 0 and after.transferred_qty == before.qty and after.transferred_cost == before.cost
+    assert rig.store.external_activity() is None
+
+
+def test_withdrawal_with_fills_since_last_clean_sync_requires_review(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=BUY_ONLY)
+    rig.step()
+    b1 = rig.row('buy:b1')
+    _buy_filled(rig, 'buy:b2')
+    before = rig.store.position()
+    assert rig.store.meta('ledger_clean')['fills'] == 1
+    rig.venue.funds['STONK'] -= before.qty                       # withdrawal ...
+    rig.venue.fill(b1['order_id'], b1['qty'])                     # ... then another BUY before it is detected
+    states = [rig.step(2.5) for _ in range(3)]
+    assert rig.store.external_activity()['reason'] == 'WITHDRAWAL_ORDER_UNKNOWN'
+    position = rig.store.position()
+    assert position.fills == 2 and position.transferred_qty == 0  # never booked at a blended guess
+    assert states[-1] == 'STOP_ACCOUNT_REVIEW'
+    assert rig.notifier.keys('withdrawal_order_unknown')
+
+
 # ---------------------------------------------------------------- foreign activity
 def test_foreign_open_order_account_review_settles_own_and_keeps_dms(tmp_path, clock):
     rig = make_rig(tmp_path, clock, usdt='1000')
@@ -231,6 +416,58 @@ def test_foreign_trade_requires_review_and_is_quarantined(tmp_path, clock):
     assert rig.store.fills() == []
     rig.settle()
     assert rig.rows() == []
+
+
+def test_other_pair_open_order_stops_for_review_on_the_account_scan_cadence(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000')
+    assert rig.step() == 'RUNNING'
+    assert rig.venue.calls.count('account_open_orders') == 1      # first pass after startup
+    own = {r['text'] for r in rig.rows()}
+    other = rig.venue.add_other_pair_order('BTC_USDT')
+    for _ in range(5):                                            # passes 2..6: no account-wide reads
+        assert rig.step(5) == 'RUNNING'
+    assert rig.venue.calls.count('account_open_orders') == 1 and rig.venue.calls.count('account_trades') == 1
+    assert rig.step(5) == 'FOREIGN_OPEN_ORDER_USE_EXCLUSIVE_ACCOUNT'   # every 6th pass
+    assert rig.store.external_activity()['reason'] == 'FOREIGN_OPEN_ORDER_USE_EXCLUSIVE_ACCOUNT'
+    assert set(texts(rig.venue.cancel_log[-1])) == own                # own orders cancelled, not the foreign one
+    with rig.store.read() as db:
+        assert [r[0] for r in db.execute('SELECT order_id FROM external_orders')] == [other.order_id]
+    assert rig.step(1) == 'STOP_ACCOUNT_REVIEW'
+    rig.settle()
+    assert rig.rows() == []
+    assert rig.status_json()['account_review_required'] is True
+
+
+def test_other_pair_trade_requires_review_with_quarantined_evidence(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000')
+    start = rig.store.start_ms()
+    rig.venue.add_other_pair_trade('ETH_USDT', at_ms=start - 60_000)      # before the campaign: ignored
+    assert rig.step() == 'RUNNING'
+    assert rig.store.external_activity() is None
+    trade = rig.venue.add_other_pair_trade('ETH_USDT')
+    states = [rig.step(5) for _ in range(6)]
+    assert states[:5] == ['RUNNING'] * 5 and states[5] == 'FOREIGN_FILL'
+    assert rig.store.external_activity()['reason'] == 'FOREIGN_FILL'
+    [evidence] = rig.store.external_fills()
+    assert evidence['trade_id'] == trade.trade_id and rig.store.fills() == []
+    assert rig.step(1) == 'STOP_ACCOUNT_REVIEW'
+
+
+def test_other_pair_activity_in_settlement_is_recorded_and_own_orders_settle(tmp_path, clock):
+    rig = make_rig(tmp_path, clock, usdt='1000')
+    rig.step()
+    rig.stop_file('STOP_TRADING')
+    rig.venue.add_other_pair_order('BTC_USDT')
+    engine2 = Engine(rig.cfg, rig.store, rig.venue, rig.hub, IndexBuilder(rig.cfg.index_settings()),
+                     FakeNotifier(), live=False, meta=rig.venue.meta)
+    rig.advance(1)
+    engine2.startup()
+    assert engine2.step() == 'STOP_ACCOUNT_REVIEW'                 # first pass after a restart scans
+    assert rig.store.external_activity()['reason'] == 'FOREIGN_OPEN_ORDER_USE_EXCLUSIVE_ACCOUNT'
+    for _ in range(4):
+        rig.advance(2.5)
+        engine2.step()
+    assert rig.rows() == []                                       # the bot's own orders still settle
 
 
 def test_closed_order_reappearing_is_unsafe(tmp_path, clock):
