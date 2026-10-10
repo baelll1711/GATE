@@ -858,7 +858,8 @@ class Engine(Reconciler):
 
     def quantity(self, side: str, level: LevelConfig, price: Decimal, center: Decimal, *,
                  exclude_text: str | None = None, apply_min: bool = True, slack: Decimal = ZERO,
-                 pending: Sequence[Mapping] = (), size_cap: bool = True) -> Decimal:
+                 pending: Sequence[Mapping] = (), size_cap: bool = True,
+                 size_price: Decimal | None = None) -> Decimal:
         """Largest permitted size of one slot at ``price`` with every reservation counted.
 
         ``exclude_text`` + ``apply_min=False`` + ``slack`` serve the resize check of a
@@ -866,12 +867,15 @@ class Engine(Reconciler):
         get ``slack`` of tolerance; a remainder below the minimum is kept).
         ``pending`` are pseudo rows of intents not reserved yet (same pass).
         ``size_cap=False`` drops the configured level size (amend fund/limit check: the
-        amount does not change, only the money it needs)."""
+        amount does not change, only the money it needs).
+        ``size_price`` sizes the configured level size at that price instead of ``price``
+        (resize check of an amended order: its amount was sized at its original price and
+        a price-only amend keeps it; money and notional limits still use ``price``)."""
         rows = self.store.orders()
         own = next((o for o in rows if o['text'] == exclude_text), None) if exclude_text else None
         active = [o for o in rows if o['text'] != exclude_text] + list(pending)
         settings = self.cfg.side(side)
-        size = requested_size(level, side, price, self.meta, self._fee_pct,
+        size = requested_size(level, side, price if size_price is None else size_price, self.meta, self._fee_pct,
                               bool(settings.get('compensate_base_fee')) if side == 'buy' else False)
         limits = [size['requested_gross_qty']] if size_cap else []
         pair = self.cfg.pair
@@ -1078,7 +1082,8 @@ class Engine(Reconciler):
             # Limits first (lesson N1): no pricing path may bypass a reduced limit.
             try:
                 allowed = self.quantity(side, level, self._reserve_price(o), center, exclude_text=text,
-                                        apply_min=False, slack=tolerance_slack)
+                                        apply_min=False, slack=tolerance_slack,
+                                        size_price=o['prior_prices'][0][0] if o['prior_prices'] else o['price'])
             except Unsafe as exc:
                 candidates[text] = str(exc)
                 continue

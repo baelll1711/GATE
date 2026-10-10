@@ -462,3 +462,17 @@ def test_helpers():
     assert distribution([])['count'] == 0 and distribution([D(3)])['p95'] == D(3)
     with pytest.raises(ValueError):
         build_report(':memory:', hours=0, now_ms=NOW)
+
+
+def test_edge_at_placement_uses_the_creation_price_of_an_amended_order(store):
+    """Regression (found by the synthetic simulation with reprice_via_amend): the centre
+    is recorded at creation, so the placement edge must use the creation price, not the
+    amended price (BUY created at 99 against centre 100 = +1 %, later amended to 99.6)."""
+    store.reserve_order(text='t-stk1-b1-amd1', side='buy', level='b1', qty=D('1'), price=D('99'), now_ms=T0 + 1000,
+                        reason='FIXED_EDGE', index_price=D('100'), center_price=D('100'))
+    store.update_order('t-stk1-b1-amd1', order_id='501', state='open')
+    store.begin_amend('t-stk1-b1-amd1', price=D('99.6'), amend_text='a1', now_ms=T0 + 5000)
+    store.confirm_amend('t-stk1-b1-amd1', T0 + 5000)
+    assert store.order('t-stk1-b1-amd1')['price'] == D('99.6')
+    report = build_report(store, hours=1, now_ms=NOW)
+    assert report['slots']['buy:b1']['avg_edge_at_placement_pct'] == buy_edge('100', '99') == D(1)

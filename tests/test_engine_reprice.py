@@ -157,3 +157,26 @@ def test_unknown_amend_cancels_and_raises_unknown_create(tmp_path, clock):
     assert row['amend_state'] is None and row['price'] == D('0.1350')     # resolved by reconciliation
     rig.settle()
     assert rig.store.order(old['b1']['text'])['state'] == 'closed'
+
+
+def test_amended_order_keeps_its_amount_without_limit_reduction(tmp_path, clock):
+    """Regression (found by the synthetic simulation): a price-only amend keeps the amount
+    that was sized at the original price; the next manage pass must not compare it with
+    the configured size at the NEW (higher BUY) price and cancel it as LIMIT_REDUCTION.
+    A real reduction (money at the new price) still cancels."""
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=AMEND)
+    rig.step()
+    old = levels(rig)
+    rig.hub.set_index('0.13644')
+    assert rig.step(3.5) == 'RUNNING'
+    assert len(rig.venue.amend_log) == 2 and rig.venue.cancel_log == []
+    for _ in range(3):
+        assert rig.step(5) == 'RUNNING'
+    assert rig.venue.cancel_log == []
+    rows = levels(rig)
+    for level in ('b1', 'b2'):
+        assert rows[level]['text'] == old[level]['text'] and rows[level]['cancel_reason'] is None
+        assert rows[level]['qty'] == old[level]['qty'] and rows[level]['prior_prices']
+    rig.venue.funds['USDT'] = D('0')                 # money really shrank: the amended orders no longer fit
+    rig.step(5)
+    assert {r['cancel_reason'] for r in rig.rows()} == {'LIMIT_REDUCTION'}

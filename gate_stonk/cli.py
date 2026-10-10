@@ -1,7 +1,9 @@
 """Command-line entry points: ``python -m gate_stonk <command> --config config.yaml`` (DESIGN §14, §18).
 
 Commands: ``validate``, ``doctor``, ``index-watch``, ``run``, ``cancel-only``, ``status``,
-``report``. ``--config`` is accepted before or after the command. Human output is Russian.
+``report``, ``simulate`` (offline run of the real engine on a SYNTHETIC market, see
+:mod:`gate_stonk.simulate`). ``--config`` is accepted before or after the command. Human
+output is Russian.
 
 Exit codes: 0 success; 1 invalid configuration, failed doctor check, missing status/database;
 2 refusal or error (live gates, lock held, unverified cancel-only, unexpected exception);
@@ -1308,6 +1310,11 @@ def cmd_report(cfg: Config, args: argparse.Namespace, deps: Deps) -> int:
     return EXIT_OK
 
 
+def cmd_simulate(cfg: Config, args: argparse.Namespace, deps: Deps) -> int:
+    from .simulate import cmd_simulate as simulate
+    return simulate(cfg, args, deps)
+
+
 # ============================================================================ parser / main
 
 COMMANDS: dict[str, Callable[[Config, argparse.Namespace, Deps], int]] = {
@@ -1318,6 +1325,7 @@ COMMANDS: dict[str, Callable[[Config, argparse.Namespace, Deps], int]] = {
     'cancel-only': cmd_cancel_only,
     'status': cmd_status,
     'report': cmd_report,
+    'simulate': cmd_simulate,
 }
 
 
@@ -1359,6 +1367,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = command('report', 'отчёт по уровням из базы')
     p.add_argument('--hours', type=float, default=24.0, help='окно отчёта в часах (по умолчанию 24)')
     p.add_argument('--out', default=None, help='сохранить JSON отчёта в файл')
+
+    p = command('simulate', 'офлайн-симуляция: настоящий engine/paper на СИНТЕТИЧЕСКОМ рынке (не реальные данные)')
+    p.add_argument('--minutes', type=float, default=60.0, help='виртуальная длительность в минутах (по умолчанию 60)')
+    p.add_argument('--seed', type=int, default=1, help='зерно синтетического рынка (по умолчанию 1)')
+    p.add_argument('--state-dir', default=None,
+                   help='папка результатов (по умолчанию <app.state_dir>/simulation_<seed>; не папка торговли)')
+    p.add_argument('--volatility', type=float, default=None,
+                   help='волатильность справедливой цены, %% за √часа (по умолчанию 1.5)')
     return parser
 
 

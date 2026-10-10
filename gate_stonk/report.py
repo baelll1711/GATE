@@ -25,8 +25,10 @@ Metric definitions (edge: positive = favourable to us; reference ``_edge``):
   ``fill_ratio_pct = orders_with_fills / orders * 100`` (an ORDER COUNT ratio, not qty).
 * ``filled_qty``, ``filled_notional_usdt`` (gross ``qty*price``), ``avg_fill_price`` =
   notional / qty (pre-fee VWAP; None for a group mixing BUY and SELL).
-* ``avg_edge_at_placement_pct`` = unweighted mean of ``edge(side, order.price,
-  order.center_price)`` over ``orders``.
+* ``avg_edge_at_placement_pct`` = unweighted mean of ``edge(side, placement price,
+  order.center_price)`` over ``orders``; the placement price is the price the order was
+  created at (an amend changes ``order.price`` but not the placement centre, the first
+  ``prior_prices`` entry keeps the original price).
 * ``avg_edge_of_fills_vs_placement_index_pct`` = fill-qty-weighted ``edge(side,
   fill.price, order.center_price)`` (the center the order was priced from).
 * ``avg_edge_of_fills_vs_index_at_fill_pct`` = qty-weighted ``edge(side, fill.price,
@@ -124,6 +126,12 @@ def distribution(values: Iterable[Decimal]) -> dict:
 
 def _post_only_reject(order: Mapping[str, Any]) -> bool:
     return order.get('finish_as') == POST_ONLY_FINISH and not order['filled_qty']
+
+
+def _placement_price(order: Mapping[str, Any]) -> Decimal:
+    """Price the order was created at (amends keep the old prices in ``prior_prices``)."""
+    prior = order.get('prior_prices') or ()
+    return prior[0][0] if prior else order['price']
 
 
 def _slot_sort_key(slot: str) -> tuple:
@@ -228,7 +236,8 @@ def _group_metrics(ctx: _Context, sides: set[str], orders: list[dict], fills: li
     qty = sum((f['qty'] for f in fills), ZERO)
     notional = sum((f['notional'] for f in fills), ZERO)
     single_side = len({f['side'] for f in fills}) == 1
-    placement = [e for e in (edge_pct(o['side'], o['price'], o['center_price']) for o in placed) if e is not None]
+    placement = [e for e in (edge_pct(o['side'], _placement_price(o), o['center_price']) for o in placed)
+                 if e is not None]
     vs_placement: list[tuple[Decimal, Decimal]] = []
     marked: dict[int, list[tuple[Decimal, Decimal]]] = {h: [] for h in MARK_HORIZONS}
     fees: dict[str, Decimal] = {ctx.base: ZERO, ctx.quote: ZERO, 'GT': ZERO, 'POINT': ZERO}
