@@ -1,0 +1,138 @@
+# gate_stonk — стартовая конфигурация (режим paper).
+# Скопируйте в config.yaml и правьте копию. Ключи только в .env (см. .env.example).
+# null отключает ограничение; 0 запрещает дальнейший объём по нему.
+# Все проценты — числа процентов (1.0 = 1%).
+
+app:
+  mode: paper                       # paper | live (live требует safety.dedicated_account_ack и GATE_LIVE_CONFIRM)
+  campaign_id: stonk_gate_test      # [A-Za-z0-9_]{1,32}; часть идентичности базы
+  client_prefix: stk1               # [a-z0-9]{1,6}; text заявки: t-<prefix>-<уровень>-<seq>
+  state_dir: runtime_stonk          # SQLite, status.json, CSV; относительно папки конфига
+  loop_seconds: 0.2                 # локальный контроль (STOP, индекс, защита цены) не реже этого
+  poll_seconds: 5                   # полная сверка по REST
+  request_timeout_seconds: 5        # таймаут HTTP-запроса
+  request_expiry_seconds: 10        # x-gate-exptime = now + это значение (создание/отмена/amend)
+  read_error_grace_seconds: 12      # сколько терпеть сбои чтения, затем снять все заявки
+  status_interval_seconds: 1        # запись status.json
+  log_level: INFO
+
+market:
+  currency_pair: STONK_USDT
+  base: STONK
+  quote: USDT
+  account: spot                     # spot | unified; doctor/run сверяют с режимом аккаунта (несовпадение -> отказ live)
+  rest_url: https://api.gateio.ws/api/v4
+  spot_ws_url: wss://api.gateio.ws/ws/v4/
+  depth_levels: 20                  # spot.order_book: 5|10|20|50|100
+  depth_interval: 100ms             # 100ms | 1000ms
+  expected_precision: null          # необязательная фиксация точности цены; несовпадение с биржей блокирует
+  expected_amount_precision: null
+
+index:
+  method: weighted_median           # weighted_median | weighted_mean
+  min_sources: 2                    # валидных источников меньше -> пара заблокирована
+  max_age_seconds: 3                # возраст котировки по умолчанию (по времени получения и времени биржи)
+  max_timestamp_skew_seconds: 2     # рассинхронизация времени между источниками
+  max_source_deviation_pct: 1.0     # отклонение от (невзвешенной) медианы источников
+  basis_offset_pct: 0               # ручной сдвиг центра: center = index * (1 + basis/100)
+  rejoin_snapshots: 3               # исключённый источник возвращается после N разных валидных снимков
+  observation_interval_seconds: 0.2 # запись индекса в SQLite, пока есть заявки
+  fx:                               # пересчёт USDC -> USDT для источников с quote: USDC
+    mode: fixed                     # fixed | binance_spot | gate_spot
+    usdc_to_usdt: 1                 # курс для mode: fixed (тоже проверяется на депег)
+    max_depeg_pct: 0.5
+    max_age_seconds: 3
+    max_spread_pct: 0.2
+  sources:
+    # price: mid | microprice | mark | last. Для mark/last max_spread_pct может быть null.
+    # heartbeat_seconds: допуск «тихого, но живого» стакана (Bybit orderbook.1 повторяет снимок раз в 3 с).
+    # rest_refresh_after_seconds: если WS молчит дольше, источник опрашивается по REST (null — выключено).
+    - {id: bybit_perp, venue: bybit_linear, symbol: STONKUSDT, quote: USDT, price: mid,
+       weight: 0.4, required: true, max_spread_pct: 0.5, heartbeat_seconds: 3,
+       rest_refresh_after_seconds: null, enabled: true}
+    - {id: bitget_perp, venue: bitget_usdt_futures, symbol: STONKUSDT, quote: USDT, price: mid,
+       weight: 0.25, required: false, max_spread_pct: 1.0, rest_refresh_after_seconds: 1.5, enabled: true}
+    - {id: bingx_perp, venue: bingx_swap, symbol: STONK-USDT, quote: USDT, price: mid,
+       weight: 0.15, required: false, max_spread_pct: 1.0, rest_refresh_after_seconds: 1.5, enabled: true}
+    - {id: gate_perp, venue: gate_futures_usdt, symbol: STONK_USDT, quote: USDT, price: mid,
+       weight: 0.1, required: false, max_spread_pct: 1.0, rest_refresh_after_seconds: 1.5, enabled: true}
+    - {id: lighter_perp, venue: lighter, symbol: STONK, quote: USDC, price: mid,
+       weight: 0.1, required: false, max_spread_pct: 1.0, rest_refresh_after_seconds: null, enabled: true}
+
+safety:
+  dedicated_account_ack: false      # true = аккаунт/субаккаунт только для бота (посторонние заявки -> STOP)
+  min_new_edge_pct: 1.0             # новая заявка не ближе этого % к центру индекса ПОСЛЕ округления
+  hard_min_edge_pct: 0.8            # стоящая заявка ближе этого % снимается сразу (локальный preflight)
+  dead_man_switch: true
+  dms_timeout_seconds: 45           # countdown_cancel_all timeout (минимум Gate 5 с)
+  dms_refresh_seconds: 15
+  require_telegram: true            # в live: долгая недоступность Telegram снимает заявки
+  terminal_settle_seconds: 2        # два согласованных наблюдения завершения с таким интервалом
+  unknown_create_margin_seconds: 30 # запас к окну x-gate-exptime при поиске неизвестной заявки
+  max_open_orders: 8
+  max_signed_actions_per_hour: 1000 # локальный предел действий (создание/отмена/amend/DMS)
+  max_order_requests_per_10s: 8     # place+amend; Gate: 10 r/s, при низком fill ratio до 10 r/10 s
+  rate_limit_utilization: 0.5       # доля документированных лимитов Gate для прочих групп запросов
+  max_clock_skew_ms: 1000           # расхождение часов с /spot/time; больше -> STOP
+  clock_check_seconds: 300
+
+execution:
+  time_in_force: poc                # только post-only
+  use_batch: true                   # пакетная отмена/создание при перестановке нескольких уровней
+  reprice_via_amend: false          # PATCH вместо отмена+новая (включать после проверки в paper и live)
+  iceberg_poc_verified: false       # live отправляет iceberg только после проверки iceberg+poc (этап 5)
+
+portfolio:
+  cash_reserve_usdt: 0              # USDT, которые нельзя тратить на покупку
+  fee_reserve_pct: 0.3              # дополнительный резерв USDT к сумме BUY
+  fee_estimate_pct: 0.1             # оценка комиссии (уточнить по GET /wallet/fee)
+  inventory_cap_tolerance_pct: 1    # допуск лимита запаса для уже стоящей BUY
+
+pair:
+  mode: both                        # buy | sell | both
+  max_inventory_usdt: 200           # запас + незавершённые BUY по текущему индексу
+  max_inventory_qty: null
+  inventory_reserve_qty: 0          # токены, которые нельзя продавать
+  initial_avg_price: null           # себестоимость токенов, бывших до бота
+  buy:
+    band_tolerance_pct: 0.15
+    reprice_threshold_pct: 0.15
+    min_reprice_seconds: 3
+    deeper_tolerance_pct: null
+    max_total_qty: null
+    max_total_notional_usdt: null
+    max_daily_notional_usdt: 200    # сутки UTC
+    compensate_base_fee: false
+    levels:
+      # Точный уровень: edge_pct. Диапазон: min_edge_pct + max_edge_pct + skip_notional_usdt
+      # (+ out_of_range: nearest_index|clamp, insufficient_depth: clamp|wait).
+      # Размер: order_notional_usdt и/или order_qty (берётся меньший).
+      # Iceberg: iceberg_display_qty (STONK) или iceberg_display_pct (% от размера); null — обычная заявка.
+      - {id: b1, edge_pct: 1.0, order_notional_usdt: 20, iceberg_display_qty: null}
+      - {id: b2, edge_pct: 2.0, order_notional_usdt: 30, iceberg_display_pct: 25}
+  sell:
+    band_tolerance_pct: 0.15
+    reprice_threshold_pct: 0.15
+    min_reprice_seconds: 3
+    deeper_tolerance_pct: null
+    max_total_qty: null
+    max_total_notional_usdt: null
+    max_daily_notional_usdt: null
+    min_profit_pct: null            # 0.5 — не продавать купленное ниже себестоимости + 0.5%
+    profit_floor_mode: hold         # hold | quote
+    levels:
+      - {id: s1, edge_pct: 1.0, order_notional_usdt: 20, iceberg_display_qty: null}
+      - {id: s2, edge_pct: 2.0, order_notional_usdt: 30, iceberg_display_pct: 25}
+
+paper:
+  initial_usdt: 500
+  initial_base: 0
+  fill_model: trade_through         # только trade_through
+  fill_on_touch: false              # true не поддерживается
+  fee_pct: null                     # null -> portfolio.fee_estimate_pct
+
+telegram:
+  enabled: false                    # для paper; в live — true
+  max_unhealthy_seconds: 120
+  summary_minutes: 60
+  notify_orders: false
