@@ -18,8 +18,8 @@ Fill model ``trade_through`` (ported from the reference simulator, adapted to a 
   order.price`` (STRICTLY through: a print at our price never fills, the queue position in
   front of us is unknown). The fill price is the ORDER price (maker).
 * A trade's amount is SHARED: it is allocated across all eligible orders in price priority
-  (BUY highest price first, SELL lowest first; then older placement first; then lower
-  order id), each order takes ``floor_qty(min(left, trade remainder))`` and the remainder
+  (BUY highest price first, SELL lowest first; then time priority: a persisted rank taken
+  at creation and renewed by every amend), each order takes ``floor_qty(min(left, trade remainder))`` and the remainder
   shrinks — a print is never reused for a deeper level. One pool serves both sides (a
   single print cannot fill a bid and an ask; only self-crossed own orders could compete).
 * Every public trade is applied once: a persisted tape watermark plus a persisted set of
@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS paper_orders(
     finish_time_ms INTEGER,
     placement_seq INTEGER NOT NULL,
     priority_ms INTEGER NOT NULL,
+    priority_rank INTEGER NOT NULL,
     fee TEXT NOT NULL DEFAULT '0',
     filled_total TEXT NOT NULL DEFAULT '0',
     amend_text TEXT);
@@ -236,7 +237,8 @@ class PaperVenue:
                 state = {
                     'version': STATE_VERSION, 'identity': self._identity(), 'created_ms': now,
                     'initial': {self.quote: wire(initial_quote), self.base: wire(initial_base)},
-                    'last_order_id': now, 'last_trade_id': 0, 'tape_seq': 0, 'dms_deadline_ms': 0,
+                    'last_order_id': now, 'last_trade_id': 0, 'last_rank': 0, 'tape_seq': 0,
+                    'dms_deadline_ms': 0,
                 }
                 _put(db, STATE_KEY, state)
                 _put(db, BALANCES_KEY, {self.quote: wire(initial_quote), self.base: wire(initial_base)})
@@ -393,8 +395,8 @@ class PaperVenue:
 
         buys = [o for o in opens if o['side'] == 'buy' and trade.price < o['price'] and eligible(o)]
         sells = [o for o in opens if o['side'] == 'sell' and trade.price > o['price'] and eligible(o)]
-        buys.sort(key=lambda o: (-o['price'], o['placement_seq'], o['order_id']))
-        sells.sort(key=lambda o: (o['price'], o['placement_seq'], o['order_id']))
+        buys.sort(key=lambda o: (-o['price'], o['priority_rank']))
+        sells.sort(key=lambda o: (o['price'], o['priority_rank']))
         remaining = trade.amount
         for order in buys + sells:
             if remaining <= 0:
@@ -579,6 +581,11 @@ class PaperVenue:
         holds = self._holds(db)
         return {name: balances[name] - holds[name] for name in balances}
 
+    @staticmethod
+    def _next_rank(state: dict) -> int:
+        state['last_rank'] = int(state.get('last_rank') or 0) + 1
+        return state['last_rank']
+
     def _create(self, db: sqlite3.Connection, state: dict, req: PlaceRequest, now: int, book: Book | None,
                 tape_seq: int) -> VenueOrder:
         """One create. Raises Rejected BEFORE mutating anything (batch items are independent)."""
@@ -592,13 +599,14 @@ class PaperVenue:
         crosses = self._crosses(req.side, price, book)
         state['last_order_id'] = int(state['last_order_id']) + 1
         order_id = state['last_order_id']
+        rank = self._next_rank(state)
         status, finish_as, finish_ms = ('cancelled', POST_ONLY_FINISH_AS, now) if crosses else ('open', 'open', None)
         iceberg = D(req.iceberg) if req.iceberg is not None else ZERO
         db.execute('INSERT INTO paper_orders(order_id,text,side,time_in_force,price,amount,left_amount,iceberg,'
-                   'status,finish_as,create_time_ms,update_time_ms,finish_time_ms,placement_seq,priority_ms) '
-                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   'status,finish_as,create_time_ms,update_time_ms,finish_time_ms,placement_seq,priority_ms,'
+                   'priority_rank) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                    (order_id, req.text, req.side, req.time_in_force, wire(price), wire(amount), wire(amount),
-                    wire(iceberg), status, finish_as, now, now, finish_ms, tape_seq, now))
+                    wire(iceberg), status, finish_as, now, now, finish_ms, tape_seq, now, rank))
         if crosses:
             LOG.info('PAPER_POST_ONLY_CANCELLED text=%s side=%s price=%s', req.text, req.side, wire(price))
         return self._venue_order(self._order_by_id(db, order_id))
@@ -752,6 +760,7 @@ class PaperVenue:
             tape_seq = self._tape_seq()
             with self.store.write() as db:
                 now = _now_ms()
+                state = self._state(db)
                 row = self._order_by_id(db, oid)
                 if row is None or row['text'] != text:
                     raise _rejected(ORDER_NOT_FOUND, 'Order not found')
@@ -762,10 +771,10 @@ class PaperVenue:
                 filled = row['amount'] - row['left_amount']
                 if price is not None:
                     self._gate_checks(price, row['amount'])
-                    if self._crosses(row['side'], price, book):
-                        raise _rejected(POST_ONLY_LABEL, 'Order would match and take immediately so its cancelled')
                     if row['side'] == 'buy' and row['left_amount'] * (price - row['price']) > free[self.quote]:
                         raise _rejected(BALANCE_NOT_ENOUGH, 'Not enough balance')
+                    if self._crosses(row['side'], price, book):
+                        raise _rejected(POST_ONLY_LABEL, 'Order would match and take immediately so its cancelled')
                     new_price, new_amount, new_left = price, row['amount'], row['left_amount']
                 else:
                     self._gate_checks(row['price'], amount)
@@ -784,10 +793,11 @@ class PaperVenue:
                     LOG.info('PAPER_AMEND_CANCELLED order_id=%s', oid)
                 else:
                     db.execute('UPDATE paper_orders SET price=?, amount=?, left_amount=?, amend_text=?, '
-                               'update_time_ms=MAX(update_time_ms, ?), placement_seq=?, priority_ms=? '
-                               'WHERE order_id=?',
+                               'update_time_ms=MAX(update_time_ms, ?), placement_seq=?, priority_ms=?, '
+                               'priority_rank=? WHERE order_id=?',
                                (wire(new_price), wire(new_amount), wire(new_left), amend_text, now, tape_seq, now,
-                                oid))
+                                self._next_rank(state), oid))
+                    _put(db, STATE_KEY, state)
                     LOG.info('PAPER_AMEND order_id=%s price=%s amount=%s', oid, wire(new_price), wire(new_amount))
                 return self._venue_order(self._order_by_id(db, oid))
 

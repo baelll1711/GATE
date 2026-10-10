@@ -386,14 +386,18 @@ class Notifier:
 
     # ----- thread -----
     def _run(self) -> None:
+        worker_error: str | None = None
         while not self._stop.is_set():
             try:
                 self.pump()
+                worker_error = None
             except Exception as exc:
                 if self.enabled:
                     self.delivery_failed = True
                 self.last_error = type(exc).__name__
-                LOG.error('Telegram worker cannot advance: %s', type(exc).__name__)
+                if worker_error != self.last_error:   # log once per error type, not every tick
+                    LOG.error('Telegram worker cannot advance: %s', self.last_error)
+                worker_error = self.last_error
             self._wake.wait(LOOP_SECONDS)
             self._wake.clear()
 
