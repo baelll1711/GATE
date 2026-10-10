@@ -573,17 +573,23 @@ class Reconciler:
     def _reconcile_positions(self) -> None:
         """Same shortfall (bot qty above the base balance) with no new fills in two complete
         reconciliations >= terminal_settle_seconds apart -> booked as a withdrawal, but only
-        when no fill happened since the last CLEAN reconciliation (balance covered the bot
-        position; meta ``ledger_clean``). Otherwise the withdrawal cannot be ordered against
-        those fills, the average cost would be a guess: account review instead."""
+        when no BUY fill happened since the last CLEAN reconciliation (balance covered the bot
+        position; meta ``ledger_clean``). A BUY between them changes the average cost, so the
+        withdrawal could not be ordered against it: account review instead. SELL fills and a
+        withdrawal booked at the average cost commute (same average, same realized), so they
+        do not block the booking. A database without the meta (older version) derives the
+        clean point from the persisted history watermark ``last_sync_ms``."""
         position = self.store.position()
         balance = self.balances.get(self.base, Balance(ZERO, ZERO))
         shortfall = position.qty - balance.total
         if position.qty <= 0 or shortfall < self.meta.lot:
             self._mismatch = None
             stored = self.store.meta('ledger_clean')
-            if not isinstance(stored, dict) or stored.get('fills') != int(position.fills):
-                self.store.set_meta('ledger_clean', {'fills': int(position.fills), 'at_ms': self._now_ms()})
+            buys = self._buy_fill_count()
+            if (not isinstance(stored, dict) or stored.get('fills') != int(position.fills)
+                    or stored.get('buys') != buys):
+                self.store.set_meta('ledger_clean', {'fills': int(position.fills), 'buys': buys,
+                                                     'at_ms': self._now_ms()})
             return
         marker = (shortfall, position.fills)
         if self._mismatch is None or self._mismatch[0] != marker:
@@ -594,13 +600,20 @@ class Reconciler:
         if time.monotonic() - self._mismatch[1] < self._settle_seconds:
             return
         clean = self.store.meta('ledger_clean')
-        clean_fills = clean.get('fills') if isinstance(clean, dict) else None
-        if not isinstance(clean_fills, int) or position.fills > clean_fills:
+        clean_buys = clean.get('buys') if isinstance(clean, dict) else None
+        if not isinstance(clean_buys, int):
+            # Database written before the clean watermark existed: BUY fills up to the last
+            # consistent reconciliation (history watermark) were already reconciled.
+            watermark = self.store.meta('last_sync_ms')
+            clean_buys = self._buy_fill_count(until_ms=int(watermark)) if isinstance(watermark, int) else None
+        buys = self._buy_fill_count()
+        clean_fills = clean_buys
+        if not isinstance(clean_buys, int) or buys > clean_buys:
             # Fills since the last clean reconciliation: the withdrawal may precede some of
             # them, so booking it after all of them at the blended average is not exact.
             self._mismatch = None
             self._diag('WITHDRAWAL_ORDER_UNKNOWN', shortfall=shortfall, position_qty=position.qty,
-                       balance=balance.total, fills=position.fills, clean_fills=clean_fills)
+                       balance=balance.total, fills=position.fills, buys=buys, clean_buys=clean_fills)
             self.store.require_account_review('WITHDRAWAL_ORDER_UNKNOWN', self._now_ms())
             self.event('withdrawal_order_unknown',
                        f'{self.base}: на балансе {fmt(balance.total)}, а куплено ботом и не продано '
@@ -612,6 +625,16 @@ class Reconciler:
                                                        base=self.base, quote=self.quote)
         self._mismatch = None
         LOG.warning('%s: %s bot-bought tokens treated as withdrawn (cost %s)', self.base, removed, cost)
+
+    def _buy_fill_count(self, until_ms: int | None = None) -> int:
+        """Own BUY executions recorded so far (optionally up to ``until_ms`` inclusive)."""
+        query = "SELECT COUNT(*) FROM fills WHERE side='buy'"
+        params: tuple = ()
+        if until_ms is not None:
+            query += ' AND time_ms<=?'
+            params = (int(until_ms),)
+        with self.store.read() as db:
+            return int(db.execute(query, params).fetchone()[0])
 
     def _position_event(self) -> None:
         now = self._now_ms()

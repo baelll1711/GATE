@@ -377,6 +377,55 @@ def test_withdrawal_with_fills_since_last_clean_sync_requires_review(tmp_path, c
     assert rig.notifier.keys('withdrawal_order_unknown')
 
 
+def _restart(rig):
+    """New process on the same database (what an upgrade or a restart does)."""
+    rig.engine = Engine(rig.cfg, rig.store, rig.venue, rig.hub, IndexBuilder(rig.cfg.index_settings()),
+                        FakeNotifier(), live=False, meta=rig.venue.meta)
+    return rig
+
+
+def test_database_without_clean_watermark_books_an_unambiguous_withdrawal(tmp_path, clock):
+    """Regression: a database written before ``ledger_clean`` existed must derive the clean
+    point from the history watermark instead of stopping on a clear-cut withdrawal."""
+    rig = make_rig(tmp_path, clock, usdt='1000', overrides=BUY_ONLY)
+    rig.step()
+    _buy_filled(rig, 'buy:b1')
+    before = rig.store.position()
+    rig.store.delete_meta('ledger_clean')                       # older database
+    withdrawn = (before.qty / 2).quantize(D('0.01'))
+    rig.venue.funds['STONK'] -= withdrawn                       # withdrawal while the bot was stopped
+    _restart(rig)
+    for _ in range(4):
+        rig.step(2.5)
+    after = rig.store.position()
+    assert rig.store.external_activity() is None
+    assert after.fills == before.fills and after.transferred_qty == withdrawn
+    assert after.avg_cost == before.avg_cost
+
+
+def test_withdrawal_followed_by_a_sell_fill_is_booked_without_review(tmp_path, clock):
+    """Regression: SELL fills and a withdrawal at the average cost commute, so a SELL between
+    the last clean reconciliation and the detection must not stop the campaign."""
+    rig = make_rig(tmp_path, clock, usdt='1000')
+    rig.step()
+    _buy_filled(rig, 'buy:b1')
+    rig.step(2.5)
+    rig.settle()
+    s1 = rig.row('sell:s1')
+    assert s1 is not None and s1['order_id']
+    before = rig.store.position()
+    withdrawn = (rig.venue.funds['STONK'] / 2).quantize(D('0.01'))
+    assert withdrawn > 0
+    rig.venue.funds['STONK'] -= withdrawn                       # withdraw part of the free base ...
+    rig.venue.fill(s1['order_id'], s1['qty'])                   # ... and the resting SELL fills meanwhile
+    for _ in range(5):
+        rig.step(2.5)
+    after = rig.store.position()
+    assert rig.store.external_activity() is None
+    assert after.transferred_qty == withdrawn
+    assert abs(after.avg_cost - before.avg_cost) < D('1e-20')  # same average (Decimal division noise only)
+
+
 # ---------------------------------------------------------------- foreign activity
 def test_foreign_open_order_account_review_settles_own_and_keeps_dms(tmp_path, clock):
     rig = make_rig(tmp_path, clock, usdt='1000')

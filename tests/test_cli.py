@@ -568,6 +568,24 @@ def test_python_m_gate_stonk_survives_redirected_ansi_stdout(tmp_path):
     assert b'UnicodeEncodeError' not in done.stderr
 
 
+def test_installed_console_script_entry_survives_redirected_ansi_stdout(tmp_path):
+    """Regression: the pip-installed ``gate-stonk`` command must configure the console too
+    (it used to call cli.main() directly and crash on a redirected ANSI stdout)."""
+    import subprocess
+    import sys
+
+    pyproject = (ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+    assert 'gate-stonk = "gate_stonk.__main__:console_main"' in pyproject
+    path = write_config(tmp_path)
+    env = {k: v for k, v in os.environ.items() if k not in ('PYTHONUTF8', 'PYTHONIOENCODING')}
+    env['PYTHONIOENCODING'] = 'cp1252'
+    code = 'import sys; from gate_stonk.__main__ import console_main; sys.argv[0] = "gate-stonk"; sys.exit(console_main())'
+    done = subprocess.run([sys.executable, '-c', code, 'validate', '--config', str(path)], cwd=str(ROOT),
+                          env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    assert done.returncode == 0, done.stderr.decode('ascii', 'replace')
+    assert b'UnicodeEncodeError' not in done.stderr
+
+
 @pytest.mark.parametrize('name', ['run_stonk.ps1', 'setup_windows.ps1'])
 def test_windows_scripts_force_utf8_before_python_and_keep_bom(name):
     raw = (ROOT / name).read_bytes()

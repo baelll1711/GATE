@@ -25,8 +25,13 @@ def configure_console(streams: Iterable[Any] | None = None) -> None:
             pass
 
 
-if __name__ == '__main__':
+def console_main() -> int:
+    """Entry point of the installed ``gate-stonk`` command (pyproject ``[project.scripts]``)."""
     configure_console()
     from .cli import main
 
-    raise SystemExit(main())
+    return main()
+
+
+if __name__ == '__main__':
+    raise SystemExit(console_main())
