@@ -1,0 +1,28 @@
+# Local credentials and account state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+config.my.yaml
+config.live*.yaml
+runtime*/
+logs*/
+reports*/
+backups/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.lock
+STOP_TRADING
+STOP_PAIR_*
+# Python and generated output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+*.zip
