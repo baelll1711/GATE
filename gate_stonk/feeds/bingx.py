@@ -92,11 +92,12 @@ class BingxAdapter(AdapterBase):
         return None
 
     def _on_text(self, text: str, now: float, wall_ms: int) -> list[Update | Reply]:
-        heartbeat = text.strip().lower()
-        if heartbeat == 'ping':
-            return [Reply('Pong')]
-        if heartbeat == 'pong':
-            return []
+        if len(text) <= 16:                       # only short frames can be heartbeats
+            heartbeat = text.strip().lower()
+            if heartbeat == 'ping':
+                return [Reply('Pong')]
+            if heartbeat == 'pong':
+                return []
         msg = self.parse(text)
         if msg is None:
             return [self.error('INVALID_WS_MESSAGE')]

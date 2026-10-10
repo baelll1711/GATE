@@ -104,6 +104,12 @@ class LighterAdapter(AdapterBase):
     ping_interval = 0.0          # server pings {"type":"ping"}; keepalive ~2 min
     idle_timeout = 60.0
 
+    @property
+    def rest_min_interval(self) -> float:
+        """Seconds between REST polls (read by the hub's refresher). Anonymous access is
+        limited to 60 requests per rolling minute; a mark/last poll costs two requests."""
+        return 4.0 if self.wants_ticker else 2.0
+
     def __init__(self, source: Any, *, timeout: float, market_index: int | None = None,
                  rest_url: str | None = None, expected_base: str | None = None) -> None:
         super().__init__(source, timeout=timeout, rest_url=rest_url, expected_base=expected_base)
@@ -166,7 +172,7 @@ class LighterAdapter(AdapterBase):
 
     def _on_text(self, text: str, now: float, wall_ms: int) -> list[Update | Reply]:
         index = self._require_index()
-        if text.strip() in PING_TEXTS:
+        if len(text) <= 32 and text.strip() in PING_TEXTS:     # cheap check before JSON parsing
             return [Reply(PONG)]
         msg = self.parse(text)
         if msg is None:

@@ -234,7 +234,18 @@ def gunzip(data: bytes, limit: int = MAX_FRAME_BYTES) -> bytes:
 
 # --------------------------------------------------------------------------- HTTP
 def _body(response: Any) -> Any:
-    """Parse a response body with exact decimals when the raw text is available."""
+    """Parse a response body with exact decimals when the raw body is available.
+
+    Raw ``content`` bytes are decoded as UTF-8 (JSON is UTF-8 by RFC 8259; requests' ``text``
+    may guess another charset when the server omits one), then ``text``, then ``json()``
+    (floats; still converted exactly through ``D(str(x))`` by the parsers).
+    """
+    content = getattr(response, 'content', None)
+    if isinstance(content, (bytes, bytearray)):
+        try:
+            return loads(bytes(content).decode('utf-8-sig'))
+        except (ValueError, RecursionError):
+            return None
     text = getattr(response, 'text', None)
     if isinstance(text, str):
         try:

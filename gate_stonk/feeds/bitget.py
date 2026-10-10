@@ -91,11 +91,12 @@ class BitgetAdapter(AdapterBase):
         return 'ping'
 
     def _on_text(self, text: str, now: float, wall_ms: int) -> list[Update | Reply]:
-        heartbeat = text.strip()
-        if heartbeat == 'pong':
-            return []
-        if heartbeat == 'ping':
-            return [Reply('pong')]
+        if len(text) <= 16:                       # only short frames can be heartbeats
+            heartbeat = text.strip()
+            if heartbeat == 'pong':
+                return []
+            if heartbeat == 'ping':
+                return [Reply('pong')]
         msg = self.parse(text)
         if msg is None:
             return [self.error('INVALID_WS_MESSAGE')]
