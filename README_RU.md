@@ -301,6 +301,12 @@ Telegram: создайте бота, нажмите у него Start в нуж�
 
 ### Шаг 4. Paper не меньше часа, затем отчёт
 
+Без доступа к биржам (как в контейнере разработки) проверить весь цикл можно офлайн:
+`python -m gate_stonk simulate --config config.yaml --minutes 60 --seed 1`. Это настоящие движок, paper-биржа,
+индекс и отчёт, но рынок **синтетический** (случайное блуждание, всплески, выпадение источников, лента сделок с
+редкими «проколами»). Цифры симуляции показывают, что цикл работает и где возникают перестановки и ожидания, но не
+доказывают доходность. Решение о live принимается только по paper на реальных данных.
+
 ```powershell
 .\.venv\Scripts\python.exe -m gate_stonk run --config config.yaml --seconds 3600
 ```
@@ -460,6 +466,7 @@ Paper читает реальные публичные данные (индек�
 | `cancel-only [--all-pair-orders --yes]` | Снять заявки бота (`t-<client_prefix>-...` и из базы) и проверить чтением до 60 с. DMS не трогает | в live | в live | только отмены |
 | `status` | Показать сохранённый `status.json` и его возраст | нет | нет | нет |
 | `report [--hours H] [--out FILE]` | Отчёт по уровням из базы режима `app.mode`, по умолчанию 24 ч | нет | нет | нет |
+| `simulate [--minutes M] [--seed S] [--volatility V] [--state-dir DIR]` | Офлайн-прогон настоящего движка и paper на **синтетическом** рынке (виртуальные часы), итог — `report.json`, `status.json` в `<state_dir>/simulation_<seed>/`. Не реальные данные | нет | нет | только бумажные |
 
 Примеры:
 
@@ -481,6 +488,8 @@ $env:GATE_LIVE_CONFIRM = "I_UNDERSTAND_SPOT_TRADING"
 .\.venv\Scripts\python.exe -m gate_stonk cancel-only --config config.live.yaml
 # снять ВСЕ заявки пары, включая чужие
 .\.venv\Scripts\python.exe -m gate_stonk cancel-only --config config.live.yaml --all-pair-orders --yes
+# офлайн-симуляция на синтетическом рынке (60 виртуальных минут примерно за минуту)
+.\.venv\Scripts\python.exe -m gate_stonk simulate --config config.yaml --minutes 60 --seed 1
 # статус и отчёт
 .\.venv\Scripts\python.exe -m gate_stonk status --config config.yaml
 .\.venv\Scripts\python.exe -m gate_stonk report --config config.yaml --hours 24 --out runtime_stonk\report_24h.json
@@ -490,8 +499,8 @@ $env:GATE_LIVE_CONFIRM = "I_UNDERSTAND_SPOT_TRADING"
 с `run`. В paper он снимает бумажные заявки в базе. Записи в базе сверяются при следующем `run`.
 
 **Обёртка `run_stonk.ps1`** принимает параметры `-Command` (`doctor`, `index-watch`, `run`, `cancel-only`,
-`status`, `report`, `validate`; по умолчанию `run`), `-Config`, `-Live`, `-Minutes` (для `index-watch`), `-Csv`,
-`-Hours` (для `report`, по умолчанию 24). Флаги `--seconds`, `--probe-write`, `--out`, `--center` и
+`status`, `report`, `validate`, `simulate`; по умолчанию `run`), `-Config`, `-Live`, `-Minutes` (для `index-watch`), `-Csv`,
+`-Hours` (для `report`, по умолчанию 24), `-Seconds` (для paper `run`), `-Seed` (для `simulate`). Флаги `--probe-write`, `--out`, `--center` и
 `--all-pair-orders` через обёртку не передаются: для них вызывайте Python напрямую.
 
 ```powershell
