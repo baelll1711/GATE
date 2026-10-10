@@ -683,7 +683,8 @@ def test_countdown_arm_and_disarm(clock):
 
 @pytest.mark.parametrize('reply', [
     {}, {'triggerTime': True}, {'triggerTime': '1800000030000'}, {'triggerTime': None}, [],
-    {'triggerTime': NOW_MS + 30_000 + 61_000}, {'triggerTime': NOW_MS - 1}, {'label': 'X'},
+    {'triggerTime': NOW_MS + 30_000 + 10_001}, {'triggerTime': NOW_MS + 30_000 - 10_001},
+    {'triggerTime': NOW_MS - 1}, {'label': 'X'},
     FakeResponse(200, raw='{"triggerTime": 1800000030000.5}'),
 ])
 def test_countdown_unacknowledged_is_unknown(clock, reply):
@@ -692,6 +693,16 @@ def test_countdown_unacknowledged_is_unknown(clock, reply):
     with pytest.raises(UnknownResult, match='DMS_NOT_ACKNOWLEDGED'):
         venue.countdown(30)
     assert venue.last_dms['outcome'] == 'unexpected_response'
+
+
+def test_countdown_accepts_small_server_skew(clock):
+    venue, session = make_venue()
+    session.queue({'triggerTime': NOW_MS + 30_000 + 9_000}, {'triggerTime': NOW_MS + 5_000 - 2_500},
+                  {'triggerTime': NOW_MS + 5_000 - 2_501})
+    assert venue.countdown(30) == NOW_MS + 39_000
+    assert venue.countdown(5) == NOW_MS + 2_500         # tolerance for 5 s is 2.5 s
+    with pytest.raises(UnknownResult):
+        venue.countdown(5)
 
 
 def test_countdown_disarm_requires_trigger_time(clock):
@@ -1141,3 +1152,33 @@ def test_no_secret_in_logs_or_errors_across_venue_flows(clock, caplog):
     venue.cancel_many([CancelRequest(text=req().text, order_id='1')])
     blob = ' '.join(str(e) for e in errors) + caplog.text + json.dumps(venue.diagnostics()) + repr(venue.client)
     assert KEY not in blob and SECRET not in blob
+
+
+def test_emergency_writes_ignore_read_checkpoint_and_charge_once(clock):
+    limiter = RateLimiter.from_settings(8)
+    venue, session = make_venue(limiter=limiter)
+
+    def blocked():
+        raise ReadInterrupted('STOP_PENDING')
+
+    venue.before_read = blocked
+    reqs = [CancelRequest(text=make_text('stk1', 's1', NOW_MS, 0), order_id='10')]
+    session.queue([{'id': '10', 'succeeded': True}], fx('countdown_reply.json'))
+    assert venue.cancel_many(reqs) == {reqs[0].text: 'sent'}
+    assert venue.countdown(30) == NOW_MS + 30_000
+    assert limiter.used('cancel') == 1 and limiter.used('dms') == 1
+    with pytest.raises(ReadInterrupted):
+        venue.open_orders()
+    assert len(session.calls) == 2
+
+
+def test_place_sell_side_is_post_only_with_expiry(clock):
+    venue, session = make_venue()
+    r = req(level='s1', side='sell', price='0.1372', amount='100')
+    session.queue(reply_for(r, oid='912345678902'))
+    order = venue.place(r)
+    body = session.calls[0]['body']
+    assert body['side'] == 'sell' and body['time_in_force'] == 'poc' and body['price'] == '0.1372'
+    assert 'stp_act' not in body and 'action_mode' not in body
+    assert session.calls[0]['headers']['x-gate-exptime'] == str(NOW_MS + 10_000)
+    assert order.side == 'sell' and order.order_id == '912345678902'

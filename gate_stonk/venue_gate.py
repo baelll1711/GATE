@@ -49,7 +49,7 @@ MAX_PAGES = 50                 # guard per traversal (my_trades: limit*(page-1) 
 TRADE_WINDOW_SECONDS = 7 * 86400  # my_trades range must be <= 30 days; query in <= 7-day slices
 DMS_MIN_TIMEOUT = 5
 DMS_MAX_TIMEOUT = 86400
-DMS_TRIGGER_TOLERANCE_MS = 60_000
+DMS_TRIGGER_TOLERANCE_MS = 10_000   # server clock skew + latency allowance (capped at timeout/2)
 UNIFIED_MODES = ('classic', 'multi_currency', 'portfolio', 'single_currency')
 _LABEL_RE = re.compile(r'[A-Z][A-Z0-9_]{0,63}')
 _CODE_RE = re.compile(r'[A-Z][A-Z0-9_]*(?::[A-Za-z0-9_.\-:]*)?')
@@ -589,8 +589,9 @@ class GateVenue:
         trigger = reply.get('triggerTime') if isinstance(reply, Mapping) else None
         valid = isinstance(trigger, int) and not isinstance(trigger, bool) and 0 <= trigger < MAX_TIME_MS
         if valid and t > 0:
-            low = sent_ms + t * 1000 - DMS_TRIGGER_TOLERANCE_MS
-            high = received_ms + t * 1000 + DMS_TRIGGER_TOLERANCE_MS
+            tolerance = max(2_000, min(DMS_TRIGGER_TOLERANCE_MS, t * 500))
+            low = sent_ms + t * 1000 - tolerance
+            high = received_ms + t * 1000 + tolerance
             valid = low <= trigger <= high
         if not valid:
             self._dms_diag(t, {'outcome': 'unexpected_response', 'response_type': type(reply).__name__})

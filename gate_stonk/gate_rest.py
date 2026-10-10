@@ -33,7 +33,7 @@ import threading
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 from urllib.parse import unquote_plus, urlencode, urlsplit
 
 from .errors import (NotSentUnsafe, RateLimited, ReadError, Rejected, UnknownResult, Unsafe,
