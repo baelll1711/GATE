@@ -1,0 +1,4 @@
+{"_comment": "SYNTHETIC. Schema: Binance Partial Book Depth Streams (vendor/lighter_fx/binance/web-socket-streams.md), raw stream usdcusdt@depth5@100ms.",
+ "frame": {"lastUpdateId": 160,
+  "bids": [["0.99990000", "1500000.00"], ["0.99980000", "900000.00"], ["0.99970000", "100.00"], ["0.99960000", "100.00"], ["0.99950000", "100.00"]],
+  "asks": [["1.00000000", "2000000.00"], ["1.00010000", "800000.00"], ["1.00020000", "100.00"], ["1.00030000", "100.00"], ["1.00040000", "100.00"]]}}

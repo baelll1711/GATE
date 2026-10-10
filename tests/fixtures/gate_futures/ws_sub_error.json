@@ -1,0 +1,1 @@
+{"time":1791640000,"time_ms":1791640000012,"id":null,"channel":"futures.book_ticker","event":"subscribe","payload":["STONKX_USDT"],"error":{"code":2,"message":"unknown contract STONKX_USDT"},"result":{"status":"fail"}}

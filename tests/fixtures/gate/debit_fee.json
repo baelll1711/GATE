@@ -1,0 +1,7 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a710.3; values invented for STONK_USDT.",
+  "_schema_source": "notes/api_gate_rest.md \u00a710.3",
+  "data": {
+    "enabled": false
+  }
+}

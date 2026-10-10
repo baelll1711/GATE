@@ -1,0 +1,1 @@
+{"time":1791640000,"time_ms":1791640000012,"id":null,"conn_id":"fac539b443fd7002","trace_id":"efe1d282b630b4aa266b84bee177791a","channel":"futures.book_ticker","event":"subscribe","payload":["STONK_USDT"],"error":null,"result":{"status":"success"}}

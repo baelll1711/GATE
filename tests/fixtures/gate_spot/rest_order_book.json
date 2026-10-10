@@ -1,0 +1,3 @@
+{"_comment": "SYNTHETIC. Schema: Gate SDK gate_api/models/order_book.py + OpenAPI example in notes/api_gate_ws_futures.md 2.3 (GET /spot/order_book?with_id=true -> id, current ms, update ms, asks, bids).",
+ "response": {"id": 48791830, "current": 1800000000050, "update": 1800000000041,
+  "asks": [["0.13600", "310"], ["0.13610", "1200"]], "bids": [["0.13580", "1500"], ["0.13570", "800"]]}}

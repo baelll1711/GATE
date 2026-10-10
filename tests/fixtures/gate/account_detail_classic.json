@@ -1,0 +1,15 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a710.4; values invented for STONK_USDT. Same shape as the real ccxt example (gate.py:1268-1276).",
+  "_schema_source": "notes/api_gate_rest.md \u00a710.4",
+  "data": {
+    "user_id": 10406147,
+    "ip_whitelist": [],
+    "currency_pairs": [],
+    "key": {
+      "mode": 1
+    },
+    "tier": 0,
+    "tier_expire_time": "0001-01-01T00:00:00Z",
+    "copy_trading_role": 0
+  }
+}

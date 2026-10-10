@@ -1,0 +1,22 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a79; values invented for STONK_USDT. null minimums/maximums = no limit; trade_status buyable.",
+  "_schema_source": "notes/api_gate_rest.md \u00a79",
+  "data": {
+    "id": "STONK_USDT",
+    "base": "STONK",
+    "base_name": "Stonk",
+    "quote": "USDT",
+    "quote_name": "Tether",
+    "fee": "0.2",
+    "min_base_amount": null,
+    "min_quote_amount": null,
+    "max_base_amount": null,
+    "max_quote_amount": null,
+    "amount_precision": 2,
+    "precision": 4,
+    "trade_status": "buyable",
+    "sell_start": 0,
+    "buy_start": 0,
+    "type": "normal"
+  }
+}

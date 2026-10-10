@@ -1,0 +1,47 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a710.5 (UnifiedAccount/UnifiedBalance models); values invented for STONK_USDT. Field meaning per SDK docstrings: available = cross available balance, freeze = frozen amount.",
+  "_schema_source": "notes/api_gate_rest.md \u00a710.5 (UnifiedAccount/UnifiedBalance models)",
+  "data": {
+    "user_id": 10001,
+    "mode": "multi_currency",
+    "refresh_time": 1800000000000,
+    "locked": false,
+    "balances": {
+      "USDT": {
+        "available": "400.5",
+        "freeze": "99.5",
+        "borrowed": "0",
+        "negative_liab": "0",
+        "futures_pos_liab": "0",
+        "equity": "500",
+        "total_freeze": "99.5",
+        "total_liab": "0",
+        "spot_in_use": "0",
+        "funding": "0",
+        "funding_version": "1",
+        "cross_balance": "500",
+        "iso_balance": "0",
+        "im": "0",
+        "mm": "0",
+        "imr": "0",
+        "mmr": "0",
+        "margin_balance": "500",
+        "available_margin": "400.5",
+        "enabled_collateral": true
+      },
+      "STONK": {
+        "available": "120",
+        "freeze": "30",
+        "borrowed": "0",
+        "equity": "150"
+      }
+    },
+    "total": "650",
+    "borrowed": "0",
+    "unified_account_total": "650",
+    "leverage": "3",
+    "spot_hedge": false,
+    "use_funding": false,
+    "is_all_collateral": true
+  }
+}

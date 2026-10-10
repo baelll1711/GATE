@@ -1,0 +1,27 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a79; values invented for STONK_USDT.",
+  "_schema_source": "notes/api_gate_rest.md \u00a79",
+  "data": {
+    "id": "STONK_USDT",
+    "base": "STONK",
+    "base_name": "Stonk",
+    "quote": "USDT",
+    "quote_name": "Tether",
+    "fee": "0.2",
+    "min_base_amount": "1",
+    "min_quote_amount": "3",
+    "max_base_amount": null,
+    "max_quote_amount": "5000000",
+    "amount_precision": 2,
+    "precision": 4,
+    "trade_status": "tradable",
+    "sell_start": 1760000000,
+    "buy_start": 1760000000,
+    "delisting_time": 0,
+    "type": "normal",
+    "trade_url": "https://www.gate.com/trade/STONK_USDT",
+    "st_tag": false,
+    "up_rate": "0.2",
+    "down_rate": "0.2"
+  }
+}

@@ -1,0 +1,5 @@
+{"_comment": "SYNTHETIC. Schema: notes/api_gate_ws_futures.md 2.5 (spot.trades, result as an array; create_time_ms is a decimal STRING; side = taker side).",
+ "frame": {"time": 1800000000, "time_ms": 1800000000200, "channel": "spot.trades", "event": "update",
+  "result": [
+   {"id": 3130257995, "create_time": 1799999999, "create_time_ms": "1799999999923.0", "side": "sell", "currency_pair": "STONK_USDT", "amount": "116.5", "price": "0.13580"},
+   {"id": 3130257996, "create_time": 1800000000, "create_time_ms": "1800000000010.399200", "side": "buy", "currency_pair": "STONK_USDT", "amount": "20", "price": "0.13600"}]}}

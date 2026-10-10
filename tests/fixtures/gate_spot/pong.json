@@ -1,0 +1,2 @@
+{"_comment": "SYNTHETIC. notes/api_gate_ws_futures.md 1.4: answer channel spot.pong (exact body by analogy with futures.pong).",
+ "frame": {"time": 1800000000, "time_ms": 1800000000001, "channel": "spot.pong", "event": "", "error": null, "result": null}}

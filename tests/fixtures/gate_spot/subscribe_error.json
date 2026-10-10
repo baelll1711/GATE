@@ -1,0 +1,4 @@
+{"_comment": "SYNTHETIC (shape copied from the CCXT comment quoted in notes/api_gate_ws_futures.md 1.3).",
+ "frame": {"time": 1800000000, "time_ms": 1800000000201, "id": 2, "conn_id": "62f2c1dabbe186d7", "trace_id": "cdb02a8c0b61086b2fe6f8fad2f98c54",
+  "channel": "spot.trades", "event": "subscribe", "payload": ["STONK_USDT"],
+  "error": {"code": 2, "message": "unknown currency pair: STONK_USDT"}, "result": {"status": "fail"}, "requestId": "cdb02a8c0b61086b2fe6f8fad2f98c54"}}

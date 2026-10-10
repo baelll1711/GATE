@@ -1,0 +1,21 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a710.3; values invented for STONK_USDT.",
+  "_schema_source": "notes/api_gate_rest.md \u00a710.3",
+  "data": {
+    "user_id": 10001,
+    "taker_fee": "0.002",
+    "maker_fee": "0.002",
+    "rpi_maker_fee": "0",
+    "gt_discount": false,
+    "gt_taker_fee": "0",
+    "gt_maker_fee": "0",
+    "loan_fee": "0.18",
+    "point_type": "1",
+    "futures_taker_fee": "0.0005",
+    "futures_maker_fee": "0",
+    "delivery_taker_fee": "0.0005",
+    "delivery_maker_fee": "0",
+    "debit_fee": 3,
+    "rpi_mm": 0
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a75.2; values invented for STONK_USDT.",
+  "_schema_source": "notes/api_gate_rest.md \u00a75.2",
+  "data": [
+    {
+      "currency_pair": "STONK_USDT",
+      "id": "912345678901",
+      "text": "t-stk1-b1-mgk2x1a00",
+      "succeeded": true,
+      "label": "",
+      "message": "",
+      "account": ""
+    },
+    {
+      "currency_pair": "STONK_USDT",
+      "id": "t-stk1-s1-mgk2x1a01",
+      "text": "",
+      "succeeded": false,
+      "label": "ORDER_NOT_FOUND",
+      "message": "Order not found",
+      "account": ""
+    }
+  ]
+}

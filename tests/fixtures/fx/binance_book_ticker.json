@@ -1,0 +1,2 @@
+{"_comment": "SYNTHETIC. Schema: notes/api_lighter_fx.md B1 (GET /api/v3/ticker/bookTicker?symbol=USDCUSDT, all values strings).",
+ "response": {"symbol": "USDCUSDT", "bidPrice": "0.99980000", "bidQty": "1000000.00", "askPrice": "0.99990000", "askQty": "1000000.00"}}

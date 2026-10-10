@@ -1,0 +1,4 @@
+{"_comment": "SYNTHETIC. Schema: notes/api_gate_rest.md (GET /spot/currency_pairs/{pair}: id, base, quote, precision, amount_precision, min_*_amount, trade_status, fee).",
+ "response": {"id": "STONK_USDT", "base": "STONK", "quote": "USDT", "fee": "0.2", "min_base_amount": "1", "min_quote_amount": "3",
+  "max_base_amount": null, "max_quote_amount": "1000000", "amount_precision": 1, "precision": 5, "trade_status": "tradable",
+  "sell_start": 0, "buy_start": 0}}

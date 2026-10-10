@@ -1,0 +1,3 @@
+{"_comment": "SYNTHETIC (shape copied from the CCXT comment quoted in notes/api_gate_ws_futures.md 1.3, pair replaced).",
+ "frame": {"time": 1800000000, "time_ms": 1800000000786, "id": 1, "conn_id": "fac539b443fd7002", "trace_id": "efe1d282b630b4aa266b84bee177791a",
+  "channel": "spot.order_book", "event": "subscribe", "payload": ["STONK_USDT", "20", "100ms"], "result": {"status": "success"}, "requestId": "efe1d282b630b4aa266b84bee177791a"}}

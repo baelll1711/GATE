@@ -1,0 +1,57 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a75.1; values invented for STONK_USDT. Reply order deliberately differs from request order (Gate does not guarantee it); match by text.",
+  "_schema_source": "notes/api_gate_rest.md \u00a75.1",
+  "data": [
+    {
+      "id": "912345678902",
+      "text": "t-stk1-s1-mgk2x1a01",
+      "amend_text": "-",
+      "create_time": "1800000000",
+      "update_time": "1800000000",
+      "create_time_ms": 1800000000123,
+      "update_time_ms": 1800000000123,
+      "status": "open",
+      "currency_pair": "STONK_USDT",
+      "type": "limit",
+      "account": "spot",
+      "side": "sell",
+      "amount": "100",
+      "price": "0.1372",
+      "time_in_force": "poc",
+      "iceberg": "0",
+      "left": "100",
+      "filled_amount": "0",
+      "fill_price": "0",
+      "filled_total": "0",
+      "avg_deal_price": "0",
+      "fee": "0",
+      "fee_currency": "STONK",
+      "point_fee": "0",
+      "gt_fee": "0",
+      "gt_maker_fee": "0",
+      "gt_taker_fee": "0",
+      "gt_discount": false,
+      "rebated_fee": "0",
+      "rebated_fee_currency": "USDT",
+      "stp_id": 0,
+      "stp_act": "-",
+      "finish_as": "open",
+      "succeeded": true,
+      "label": "",
+      "message": "",
+      "order_id": "912345678902"
+    },
+    {
+      "text": "t-stk1-b2-mgk2x1a02",
+      "succeeded": false,
+      "label": "BALANCE_NOT_ENOUGH",
+      "message": "Not enough balance"
+    },
+    {
+      "text": "t-stk1-b1-mgk2x1a00",
+      "succeeded": false,
+      "label": "POC_FILL_IMMEDIATELY",
+      "message": "Order would match and take immediately so its cancelled"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{"_comment": "SYNTHETIC. Schema: notes/api_gate_ws_futures.md 2.2 (spot.order_book full snapshot: t ms, lastUpdateId, s, l, bids desc, asks asc as [price, amount] strings).",
+ "frame": {"time": 1800000000, "time_ms": 1800000000123, "channel": "spot.order_book", "event": "update",
+  "result": {"t": 1799999999900, "lastUpdateId": 48791820, "s": "STONK_USDT", "l": "20",
+   "bids": [["0.13580", "1520.5"], ["0.13570", "800"], ["0.13560", "50"]],
+   "asks": [["0.13600", "300"], ["0.13610", "1200"], ["0.13620", "75.25"]]}}}

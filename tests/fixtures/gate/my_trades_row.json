@@ -1,0 +1,23 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a78; values invented for STONK_USDT. create_time_ms is a decimal STRING as in the real ccxt example (gate.py:3845-3859).",
+  "_schema_source": "notes/api_gate_rest.md \u00a78",
+  "data": {
+    "id": "2876130500",
+    "create_time": "1800000010",
+    "create_time_ms": "1800000010777.399200",
+    "currency_pair": "STONK_USDT",
+    "side": "buy",
+    "role": "maker",
+    "amount": "10.97",
+    "price": "0.1345",
+    "order_id": "912345678901",
+    "fee": "0.01097",
+    "fee_currency": "STONK",
+    "point_fee": "0",
+    "gt_fee": "0",
+    "amend_text": "-",
+    "sequence_id": "588018",
+    "text": "t-stk1-b1-mgk2x1a00",
+    "deal": "1.47546500"
+  }
+}

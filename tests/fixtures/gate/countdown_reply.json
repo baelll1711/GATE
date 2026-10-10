@@ -1,0 +1,7 @@
+{
+  "_comment": "SYNTHETIC fixture (not a recorded exchange reply): structure from the official SDK models (gate-api 7.2.144) as summarized in notes/api_gate_rest.md \u00a77; values invented for STONK_USDT. triggerTime is camelCase (SDK trigger_time.py attribute_map); value = clock fixture now + 30 s.",
+  "_schema_source": "notes/api_gate_rest.md \u00a77",
+  "data": {
+    "triggerTime": 1800000030000
+  }
+}
