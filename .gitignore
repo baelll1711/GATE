@@ -16,6 +16,8 @@ backups/
 *.lock
 STOP_TRADING
 STOP_PAIR_*
+STOP_BUY
+STOP_SELL
 # Python and generated output
 .venv/
 venv/
