@@ -28,7 +28,7 @@ import logging
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -108,7 +108,7 @@ class Histogram:
         """Nearest rank: the smallest value with cumulative share >= q (0 < q <= 100)."""
         if not self.n:
             return None
-        rank = max(1, int((Decimal(q) / HUNDRED * self.n).to_integral_value(rounding='ROUND_CEILING')))
+        rank = max(1, int((Decimal(q) / HUNDRED * self.n).to_integral_value(rounding=ROUND_CEILING)))
         seen = 0
         for value in sorted(self.counts):
             seen += self.counts[value]

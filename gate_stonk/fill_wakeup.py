@@ -157,13 +157,17 @@ class FillWakeup:
         return f'FillWakeup(pair={self.pair!r}, connected={self._connected})'
 
     # ------------------------------------------------------------------ lifecycle
-    def start(self) -> None:
+    def make_worker(self) -> Any:
+        """Create (not start) the socket worker; ``start()`` runs it in a daemon thread."""
         from .feeds.ws import WsWorker
 
+        self._worker = WsWorker(_PrivateAdapter(self), _Sink(self), timeout=self.timeout, connect=self._connect)
+        return self._worker
+
+    def start(self) -> None:
         if self._worker is not None:
             return
-        self._worker = WsWorker(_PrivateAdapter(self), _Sink(self), timeout=self.timeout, connect=self._connect)
-        self._worker.start()
+        self.make_worker().start()
 
     def stop(self) -> None:
         worker, self._worker = self._worker, None

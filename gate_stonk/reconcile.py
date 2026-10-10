@@ -151,6 +151,8 @@ class Reconciler:
         to_close: list[tuple[dict, str, Decimal, Any]] = []
         for row in self.store.orders():
             text = row['text']
+            if text not in observations:       # cannot happen in one thread; never guess
+                raise TransientUnsafe('ORDER_OBSERVATION_MISSING')
             status, left, stamp, finish_as, amount, _order = observations[text]
             executed = self.store.fill_qty(text)
             expected = amount if status == 'filled' else amount - left
