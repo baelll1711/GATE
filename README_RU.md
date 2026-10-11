@@ -17,7 +17,7 @@ Lighter и Gate futures. По умолчанию режим `paper`: реаль�
 **Состояние на 2026-10-10.** Из среды сборки биржи недоступны: `doctor` здесь завершается `ProxyError`.
 Ни одно значение для STONK (шаг цены, минимумы, точные символы) пока не подтверждено. Цифр этапа 1 (спреды,
 базис, доля блокировки индекса) ещё нет. Live-действия не выполнялись. Windows и реальная доставка Telegram
-не проверялись. Офлайн-тесты: 1808 прошли, пропусков нет (Linux, Python 3.13). Офлайн-симуляция на
+не проверялись. Офлайн-тесты: 1872 прошли, пропусков нет (Linux, Python 3.13). Офлайн-симуляция на
 синтетическом рынке (2 прогона по 60 мин) прошла без нарушений инвариантов (раздел 7, шаг 4).
 
 ## 1. Что делает бот
@@ -165,12 +165,13 @@ cp -n .env.example .env && chmod 600 .env
 | Путь | Что это |
 |---|---|
 | `config.yaml` | Рабочий конфиг paper. Для live заведите отдельный, например `config.live.yaml` |
+| `config.live.example.yaml` | Шаблон live-конфига: отдельные кампания и папка `runtime_live`, без iceberg, малые размеры и лимиты; копируется в `config.live.yaml` (шаг 5) |
 | `.env` | Ключи; читается из папки конфига |
 | `STOP_TRADING`, `STOP_BUY`, `STOP_SELL` | STOP-файлы; создаются в папке конфига (раздел 10) |
-| `runtime_stonk/` (`app.state_dir`) | `paper.sqlite3` или `live.sqlite3`, `status.json`, `doctor.json`, `index_watch.sqlite3`, CSV, `logs/gate_stonk_<дата UTC>.log`, `process.lock` |
+| `runtime_stonk/` (`app.state_dir`) | `paper.sqlite3` или `live.sqlite3`, `status.json`, `doctor.json`, `index_watch.sqlite3`, CSV, `logs/gate_stonk_<дата UTC>.log`, `process.lock`; в live-папке ещё `smoke/` (отчёты и кандидаты фикстур `smoke-test`) |
 
-`.gitignore` исключает из коммитов `.env`, `config.live*.yaml`, `config.my.yaml`, `runtime*/`, базы и
-STOP-файлы. Не удаляйте базу ради «сброса»: в ней резервы, счётчики лимитов, учёт и очередь Telegram. Для
+`.gitignore` исключает из коммитов `.env`, `config.live*.yaml` (кроме шаблона `config.live.example.yaml`),
+`config.my.yaml`, `runtime*/`, базы и STOP-файлы. Не удаляйте базу ради «сброса»: в ней резервы, счётчики лимитов, учёт и очередь Telegram. Для
 нового сценария заведите другой `state_dir` и `campaign_id`. База помнит кампанию, пару, режим, префикс и тип
 аккаунта, и при несовпадении `run` откажется стартовать.
 
@@ -386,92 +387,131 @@ Paper читает реальные публичные данные (индек�
 
 ### Шаг 5. Live smoke-тест: только после явного «да» заказчика
 
-Каждый шаг с реальной заявкой выполняется **только после явного «да» заказчика в чате**. Цель: одна
-минимальная post-only BUY далеко от рынка (не выше индекс −10%), проверка в `status`, отмена, проверка
-чтением, DMS. Подробный чек-лист с ручными запросами (`gcall.py`) — API_NOTES §9.2. Ниже тот же сценарий
-силами бота.
+Запускается **только после явного «да» заказчика в чате**. Весь сценарий этапа 4 выполняет одна команда
+`smoke-test`: одна минимальная post-only BUY далеко от рынка (не выше индекс −10%), проверка чтением и статус,
+отмена, проверка чтением, DMS. Заодно она записывает факты биржи, которые в API_NOTES ещё помечены
+«НЕ ПОДТВЕРЖДЕНО».
 
-1. Скопируйте `config.example.yaml` в `config.live.yaml` и измените (это фрагменты, остальные поля оставьте):
+1. Конфиг. Скопируйте `config.live.example.yaml` в `config.live.yaml` (рядом с `.env`). В шаблоне уже стоят
+   `app.mode: live`, кампания `stonk_live`, папка `runtime_live`, `dedicated_account_ack: true`, включённый
+   Telegram, уровни без iceberg, допуск полосы и порог перестановки 0.5% на обеих сторонах (решение
+   заказчика), малые размеры и лимиты: `max_inventory_usdt` 50, суточные лимиты BUY и SELL по 50 USDT.
+   `market.account` поставьте таким, как покажет `doctor` (`spot` или `unified`). Из конфига smoke-тест берёт
+   пару, аккаунт, `client_prefix`, источники индекса, `safety.dms_timeout_seconds`,
+   `safety.max_clock_skew_ms` и `app.state_dir`. Уровни и лимиты лестницы он не использует (только
+   проверяет, что среди них нет уровня с id `smk`: так помечаются smoke-заявки).
 
-   ```yaml
-   app:
-     mode: live
-     campaign_id: stonk_live_smoke
-     state_dir: runtime_live_smoke     # отдельная база для live
-   market:
-     account: spot                     # или unified, как покажет doctor
-   safety:
-     dedicated_account_ack: true
-     dead_man_switch: true
-     require_telegram: true
-   telegram:
-     enabled: true
-   pair:
-     mode: buy
-     max_inventory_usdt: 10
-     buy:
-       max_total_notional_usdt: 10
-       max_daily_notional_usdt: 10
-       levels:
-         - {id: b1, edge_pct: 10, order_notional_usdt: 3.5, iceberg_display_qty: null}   # без iceberg
-     sell:
-       levels: []
-   ```
-
-   `order_notional_usdt` подберите так, чтобы `doctor` в проверке «Размеры уровней и минимумы пары» показал
-   OK: чуть выше `min_quote_amount` пары с запасом на округление количества. Число 3.5 здесь только пример.
-
-2. Проверки только чтением, с ключами в `.env`:
+2. Проверки только чтением:
 
    ```powershell
    .\.venv\Scripts\python.exe -m gate_stonk validate --config config.live.yaml
    .\.venv\Scripts\python.exe -m gate_stonk doctor --config config.live.yaml --seconds 30
    ```
 
-   Нужно, чтобы режим аккаунта совпал, на паре было 0 открытых заявок, баланс USDT покрывал заявку, списание
-   в GT было выключено, а уровень `b1` проходил минимумы. По желанию добавьте `--probe-write` (выключает DMS
-   пары; разумно, только пока заявок нет; при запущенном боте отклоняется).
+   Нужно, чтобы режим аккаунта совпал, на паре и на других парах аккаунта было 0 открытых заявок, свободных
+   USDT хватало на заявку (до 10 USDT) и списание комиссии в GT было выключено.
 
-3. Запуск. Подтверждение задаётся только в текущем окне PowerShell:
+3. Smoke-тест. Подтверждение задаётся только в текущем окне PowerShell:
 
    ```powershell
    $env:GATE_LIVE_CONFIRM = "I_UNDERSTAND_SPOT_TRADING"
-   .\.venv\Scripts\python.exe -m gate_stonk run --config config.live.yaml --live
+   .\.venv\Scripts\python.exe -m gate_stonk smoke-test --config config.live.yaml --live
    ```
 
-   В Linux подтверждение задаётся только для одной команды:
-   `GATE_LIVE_CONFIRM=I_UNDERSTAND_SPOT_TRADING .venv/bin/python -m gate_stonk run --config config.live.yaml --live`.
+   То же через обёртку: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run_stonk.ps1 -Command
+   smoke-test -Config config.live.yaml -Live`. В Linux:
+   `GATE_LIVE_CONFIRM=I_UNDERSTAND_SPOT_TRADING .venv/bin/python -m gate_stonk smoke-test --config config.live.yaml --live`.
 
-4. Во втором окне выполните `status --config config.live.yaml` и проверьте:
-   - `slots."buy:b1".state = OPEN`, есть `order.order_id`;
-   - `order.price` не выше `index.center × 0.9` (центр равен индексу при `basis_offset_pct: 0`);
-   - `dms_remaining_seconds` положительный и не больше 45;
-   - пришло стартовое сообщение Telegram, заявка видна в веб-интерфейсе Gate.
-5. Отмена. Создайте `STOP_TRADING` в папке конфига. В `status` должны быть `state: STOP_TRADING`, слот
-   `ABSENT`, `own_orders_settled: true`, `exchange_orders_empty: true` и `dms_deadline_ms: 0` (DMS выключен
-   после сверки пустого аккаунта). Затем остановите процесс Ctrl+C.
-6. Проверка чтением:
-   `.\.venv\Scripts\python.exe -m gate_stonk cancel-only --config config.live.yaml`. Ожидается строка
-   «Проверено чтением: открытых заявок бота по паре нет.» Эта команда не требует `GATE_LIVE_CONFIRM` и не
-   трогает DMS.
-7. DMS, с отдельным «да». Удобнее всего по API_NOTES §9.2, шаг 5.10: одна дальняя заявка, countdown 10 с,
-   ожидание 15 с, проверка статуса, выключение. Вариант силами бота:
-   - удалите `STOP_TRADING`, снова запустите `run --live` и дождитесь `OPEN`;
-   - аварийно завершите процесс (`Stop-Process -Id <process.pid из status.json> -Force`; в Linux
-     `kill -9 <pid>`);
-   - через 60 с выполните `doctor --config config.live.yaml --seconds 5`: в «Открытые заявки пары» должно быть
-     «открыто 0»;
-   - создайте `STOP_TRADING` и ещё раз запустите `run --live`, чтобы бот сверил и закрыл сохранённую строку
-     (`RECOVERY`); затем Ctrl+C.
-8. Запишите результаты по списку «Что записать по итогам этапа 5» (API_NOTES §9.2) и передайте заказчику.
-   Флаги `execution.iceberg_poc_verified` и `execution.reprice_via_amend` включаются только после
-   соответствующих проверок (шаги 5.5 и 5.9 там же).
+   Что делает команда, по порядку:
+   - проверяет те же допуски live, что и `run` (раздел 8), в том же порядке; Telegram не нужен. Затем берёт
+     блокировки бота: при запущенном `run` команда отказывает (`LOCK_HELD`);
+   - **только чтение**: часы против `/spot/time` (не больше `safety.max_clock_skew_ms`), пара доступна для BUY,
+     режим аккаунта и белый список пар ключа, на паре нет открытых заявок (`SMOKE_PAIR_NOT_EMPTY`), на других
+     парах аккаунта тоже (`SMOKE_ACCOUNT_NOT_EMPTY`), комиссии (справочно), валидный индекс и стакан спота
+     (ожидание до `--index-seconds`, по умолчанию 30 с), расчёт заявки, свободные USDT. Любая неудача — отказ с
+     кодом 2, ничего не отправлено;
+   - цена — меньшее из индекса и центра × (1 − край/100), вниз до шага цены. Центр — это индекс со сдвигом
+     `index.basis_offset_pct`; при положительном сдвиге цена всё равно берётся от индекса, поэтому BUY всегда
+     не выше индекс −10%. Край не меньше 10% (`--edge-pct`, по умолчанию 10). Непосредственно перед созданием
+     цена пересчитывается по свежему индексу и может только понизиться (обычный тик индекса вниз не приводит к
+     отказу; объём остаётся прежним, сумма уменьшается, понижение записывается в
+     `facts.price_lowered_before_create`). Затем она сверяется со свежим индексом и стаканом: не выше
+     индекс × 0.9 и центр × 0.9, ниже лучших ask и bid и не ближе 5% к лучшему bid. Если при пониженной цене
+     объём уже не дотягивает до `min_quote_amount` пары, команда отказывает
+     (`QTY_BELOW_PAIR_MINIMUM_AT_LOWER_PRICE`). Если спот торгуется намного ниже индекса (цена оказалась бы у
+     самого bid), команда отказывает (`SMOKE_PRICE_GUARD`, `PRICE_TOO_CLOSE_TO_BEST_BID`): увеличьте
+     `--edge-pct`. В отчёте записано, от чего взята цена (`price_base`: `index` или `center`). Объём — минимум
+     пары (`min_base_amount`, `min_quote_amount`) плюс 2%,
+     вверх до лота; если минимум суммы неизвестен (`null`), берётся 5 USDT. Сумма больше `--max-notional` (по
+     умолчанию 10 USDT, не больше 100) — отказ. Заявка `poc`, без iceberg, text `t-<client_prefix>-smk-...`;
+   - DMS (`countdown_cancel_all` на `safety.dms_timeout_seconds`) включается **до** создания заявки;
+   - отправляется одна заявка. Ответ классифицируется: принята и открыта; принята, но сразу снята как taker
+     (`finish_as=poc`); отказ с label; результат неизвестен. В последнем случае заявка ищется по text в
+     открытых, по text и в списке finished до конца окна `x-gate-exptime` и повторно не отправляется;
+   - проверка чтением: `get_order` по id (open, left = amount, poc, text, цена, account), по text (записывается,
+     работает ли), заявка есть в открытых, USDT заблокированы. Печатается статус заявки, DMS продлевается один
+     раз;
+   - отмена по order_id. Проверка: status cancelled, `finish_as`, left, заявки нет в открытых, сделок нет.
+     Поиск по text после отмены и список finished за окно записываются;
+   - DMS выключается (`countdown` 0) только после того, как пара прочитана пустой. Затем итоговое чтение
+     открытых заявок пары: должно быть 0;
+   - уборка выполняется всегда: при ошибке, по Ctrl+C, а также по SIGTERM и Ctrl+Break или закрытию окна
+     консоли в Windows (повторный сигнал во время уборки её не прерывает). Своя заявка, которая может быть
+     открыта, снимается по id (по text, если id неизвестен; тогда она ищется по text в открытых и в списке
+     finished). Снятой она считается только по прямому чтению (`get_order`): одного пустого списка открытых
+     заявок мало, он может отставать. Чужие заявки не трогаются. DMS выключается, только если все
+     smoke-заявки подтверждены снятыми и два чтения открытых заявок пары с интервалом
+     `safety.terminal_settle_seconds` пусты. Иначе (заявка по `get_order` открыта, прочитать её не удалось,
+     на паре есть заявки) DMS остаётся включённым и снимет заявки пары в `triggerTime`; команда пишет об
+     этом.
+
+   Вывод: пронумерованные шаги с `OK`, `ОШИБКА`, `ИНФО`, `ПРОПУЩЕН` или `ОТКАЗ`, блок статуса заявки, итог и
+   факты для API_NOTES. Коды выхода: 0 — все обязательные шаги OK и пара проверена пустой; 2 — отказ, ни одна
+   заявка не отправлялась (предпроверки или повторная проверка цены перед первой заявкой; если DMS уже был
+   включён, он выключен после проверки пары чтением); 1 — ошибка, в том числе запрошенный `--dms-fire`, который
+   не выполнен (см. ниже).
+
+4. Результаты:
+   - `runtime_live\smoke\smoke_<UTC>.json`. В нём идентичность конфига (без ключей), проверки, каждый шаг
+     (`PASS`/`FAIL`/`INFO`) и каждый запрос: метод, эндпоинт, параметры, тело, HTTP-код, label, заголовки
+     `X-Gate-RateLimit-*`, задержка и ответ, где `user_id` и IP заменены на `***`. Заголовки запросов (ключ,
+     подпись) не записываются. В `facts` — ответы на открытые вопросы API_NOTES: путь отказа post-only (если
+     был), поля ответа создания (эхо `account` и `time_in_force`, `amend_text` по умолчанию), значения
+     `finish_as`, поиск по text до и после завершения, форма ответа `countdown(0)`, label просроченного
+     `x-gate-exptime` (с `--probe-exptime`), поведение DMS (с `--dms-fire`);
+   - `runtime_live\smoke\fixtures\<UTC>\` — каждый JSON-ответ как кандидат фикстуры. Как перенести их в
+     `tests/fixtures/gate/recorded/`, написано в `runtime_live\smoke\fixtures\README.md`.
+
+   JSON передайте заказчику. Факты переносятся в API_NOTES §9.2, «Что записать по итогам этапа 5».
+
+5. Дополнительные проверки, каждая с отдельным «да»:
+   - `--probe-exptime`: до заявки отправляет две отмены несуществующей заявки (id 1). Первая — с
+     `x-gate-exptime` на минуту в прошлом, вторая, контрольная, — с обычным. Записываются label и HTTP-код
+     обеих. Открытых заявок на аккаунте в этот момент нет: это уже проверено чтением;
+   - `--dms-fire`: после основной проверки выставляется вторая такая же дальняя заявка (DMS включён до неё),
+     затем DMS ставится на 10 с без продления. Команда ждёт до 25 с, опрашивая заявку каждые 2 с, пока Gate не
+     снимет её сам. Записываются status, `finish_as` и задержка. Если DMS не сработал, заявка снимается
+     отменой, а шаг получает `ОШИБКА`. Перед этим печатается предупреждение. Если перед второй заявкой
+     повторная проверка цены не прошла (индекс успел упасть), вторая заявка не отправляется: шаг получает
+     `ПРОПУЩЕН`, DMS выключается после проверки пары чтением, код выхода 1 (не 2: первая заявка уже была), а
+     итог отдельно пишет, что основная проверка пройдена и `--dms-fire` надо повторить.
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m gate_stonk smoke-test --config config.live.yaml --live --probe-exptime --dms-fire
+   ```
+
+**Запасной ручной путь.** Если команда недоступна или нужно повторить отдельный шаг, используйте ручной
+чек-лист с подписанными запросами `gcall.py` (API_NOTES §9.2, шаги 5.1–5.10). После него
+`cancel-only --config config.live.yaml` и `doctor` должны показать 0 открытых заявок пары. Флаги
+`execution.iceberg_poc_verified` и `execution.reprice_via_amend` включаются только после соответствующих
+проверок (шаги 5.5 и 5.9 там же): smoke-тест их не проверяет.
 
 ### Шаг 6. Небольшой live
 
-Переходите к нему после успешного smoke-теста и отдельного решения заказчика. Начните с одного уровня на
-сторону, без iceberg, с размерами у минимума пары и маленькими лимитами (`max_inventory_usdt`,
-`max_daily_notional_usdt`, `max_total_notional_usdt`). Сначала одна сторона, если так решит заказчик.
+Переходите к нему после успешного smoke-теста и отдельного решения заказчика. Основа — тот же
+`config.live.yaml` из `config.live.example.yaml`. Начните с одного уровня на сторону, без iceberg, с размерами у
+минимума пары и маленькими лимитами (`max_inventory_usdt`, `max_daily_notional_usdt`,
+`max_total_notional_usdt`). Сначала одна сторона, если так решит заказчик.
 Параллельно гоняйте paper с той же лестницей в другой папке `state_dir`. Раз в сутки смотрите
 `report --config config.live.yaml --hours 24`. Расширяйте лестницу только после того, как live совпал с paper
 за тот же период.
@@ -505,12 +545,15 @@ Paper читает реальные публичные данные (индек�
 В live новые заявки ждут первой подтверждённой доставки Telegram (стартового сообщения). Если Telegram
 недоступен дольше `telegram.max_unhealthy_seconds` (120 с), заявки снимаются (`TELEGRAM_UNAVAILABLE`).
 
+`smoke-test` проверяет те же условия в том же порядке, кроме `--seconds`, Telegram и iceberg (smoke-тесту они
+не нужны), и ещё отказывает в paper (`SMOKE_TEST_LIVE_ONLY`). Затем он берёт те же блокировки.
+
 ## 9. Команды
 
 Формат: `python -m gate_stonk <команда> --config <файл>`. `--config` можно указать до или после команды, по
 умолчанию `config.yaml`. `--version` печатает версию. Коды выхода: 0 — успех; 1 — ошибка конфига, проваленный
-`doctor`, нет статуса или базы; 2 — отказ (допуск live, занятая блокировка, неподтверждённый `cancel-only`,
-ошибка); 130 — прервано.
+`doctor` или шаг `smoke-test`, нет статуса или базы; 2 — отказ (допуск live, занятая блокировка, отказ
+`smoke-test` до отправки заявки, неподтверждённый `cancel-only`, ошибка); 130 — прервано.
 
 | Команда | Что делает | Сеть | Ключи | Заявки |
 |---|---|---|---|---|
@@ -521,6 +564,7 @@ Paper читает реальные публичные данные (индек�
 | `cancel-only [--all-pair-orders --yes]` | Снять заявки бота (`t-<client_prefix>-...` и из базы) и проверить чтением до 60 с. DMS не трогает | в live | в live | только отмены |
 | `status` | Показать сохранённый `status.json` и его возраст | нет | нет | нет |
 | `report [--hours H] [--out FILE]` | Отчёт по уровням из базы режима `app.mode`, по умолчанию 24 ч | нет | нет | нет |
+| `smoke-test --live [--edge-pct E] [--max-notional N] [--index-seconds S] [--dms-fire] [--probe-exptime]` | Live smoke-тест (шаг 5, только после «да» заказчика): одна дальняя post-only BUY не выше индекс −10%, проверка чтением, отмена, проверка, DMS; отчёт `smoke/smoke_<UTC>.json` и кандидаты фикстур | да | да | одна заявка (две с `--dms-fire`) и её отмена |
 | `simulate [--minutes M] [--seed S] [--volatility V] [--state-dir DIR]` | Офлайн-прогон настоящего движка и paper на **синтетическом** рынке (виртуальные часы), итог — `report.json`, `status.json` в `<state_dir>/simulation_<seed>/`. Не реальные данные | нет | нет | только бумажные |
 
 Примеры:
@@ -539,6 +583,8 @@ Paper читает реальные публичные данные (индек�
 # live (подтверждение только в этом окне)
 $env:GATE_LIVE_CONFIRM = "I_UNDERSTAND_SPOT_TRADING"
 .\.venv\Scripts\python.exe -m gate_stonk run --config config.live.yaml --live
+# live smoke-тест (только после явного «да» заказчика; подтверждение — в этом же окне)
+.\.venv\Scripts\python.exe -m gate_stonk smoke-test --config config.live.yaml --live
 # снять заявки бота и проверить чтением (бот должен быть остановлен)
 .\.venv\Scripts\python.exe -m gate_stonk cancel-only --config config.live.yaml
 # снять ВСЕ заявки пары, включая чужие
@@ -554,15 +600,18 @@ $env:GATE_LIVE_CONFIRM = "I_UNDERSTAND_SPOT_TRADING"
 с `run`. В paper он снимает бумажные заявки в базе. Записи в базе сверяются при следующем `run`.
 
 **Обёртка `run_stonk.ps1`** принимает параметры `-Command` (`doctor`, `index-watch`, `run`, `cancel-only`,
-`status`, `report`, `validate`, `simulate`; по умолчанию `run`), `-Config`, `-Live`, `-Minutes` (для `index-watch`), `-Csv`,
-`-Hours` (для `report`, по умолчанию 24), `-Seconds` (для paper `run`), `-Seed` (для `simulate`). Флаги `--probe-write`, `--out`, `--center` и
-`--all-pair-orders` через обёртку не передаются: для них вызывайте Python напрямую.
+`status`, `report`, `validate`, `simulate`, `smoke-test`; по умолчанию `run`), `-Config`, `-Live` (для `run` и
+`smoke-test`), `-DmsFire` и `-ProbeExptime` (для `smoke-test`), `-Minutes` (для `index-watch`), `-Csv`, `-Hours` (для
+`report`, по умолчанию 24), `-Seconds` (для paper `run`), `-Seed` (для `simulate`). Флаги `--probe-write`, `--out`,
+`--center`, `--all-pair-orders`, `--edge-pct`, `--max-notional` и `--index-seconds` через обёртку не передаются:
+для них вызывайте Python напрямую.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run_stonk.ps1 -Command doctor
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run_stonk.ps1 -Command index-watch -Minutes 30
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run_stonk.ps1 -Command report -Hours 1
 $env:GATE_LIVE_CONFIRM = "I_UNDERSTAND_SPOT_TRADING"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run_stonk.ps1 -Command smoke-test -Config config.live.yaml -Live
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run_stonk.ps1 -Command run -Config config.live.yaml -Live
 ```
 

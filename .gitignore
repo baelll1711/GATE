@@ -6,6 +6,7 @@
 *.key
 config.my.yaml
 config.live*.yaml
+!config.live.example.yaml
 runtime*/
 logs*/
 reports*/

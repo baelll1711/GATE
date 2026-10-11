@@ -26,7 +26,9 @@ Signing is exactly the official SDK's (``api_client.gen_sign``): HMAC-SHA512 (he
 ``METHOD\\n/api/v4<path>\\n<unquoted query>\\n<sha512 hex of the body bytes>\\n<ts>``
 with headers ``KEY``, ``Timestamp``, ``SIGN``. ``x-gate-exptime`` (ms epoch, not
 signed) is sent on order create / batch create / cancel / batch cancel / cancel-all /
-amend only — not on ``countdown_cancel_all`` and not on reads.
+amend only — not on ``countdown_cancel_all`` and not on reads. Its value is always
+``now + request_expiry_seconds``, except in ``probe_expired_exptime`` (``smoke-test
+--probe-exptime`` only), which sends one cancel of a nonexistent order id with an expired value.
 """
 from __future__ import annotations
 
@@ -254,6 +256,28 @@ class GateRestClient:
         return self._request(method, path, params, body, signed=True, bucket=bucket, emergency=emergency,
                              expire=expire, cost=cost)
 
+    def probe_expired_exptime(self, order_id: str, params: Any, *, expired_ms: int) -> Any:
+        """``smoke-test --probe-exptime`` ONLY (API_NOTES §9.2, step 5.2): one signed
+        ``DELETE /spot/orders/{order_id}`` whose ``x-gate-exptime`` is deliberately in the PAST,
+        to learn which label / HTTP status Gate returns for an expired request.
+
+        Narrow by construction: only a single-order cancel of a numeric id, ``currency_pair``
+        required, and ``expired_ms`` must be at least 1 s in the past. Nothing else in the
+        bot can set the header; every other request keeps ``now + request_expiry_seconds``.
+        The reply is classified as usual (the expected outcome is ``Rejected``).
+        """
+        oid = str(order_id) if isinstance(order_id, int) and not isinstance(order_id, bool) else order_id
+        if not isinstance(oid, str) or not re.fullmatch(r'[1-9][0-9]{0,31}', oid):
+            raise not_sent(ValueError('PROBE_ORDER_ID_INVALID'))
+        pairs = list(params.items()) if isinstance(params, Mapping) else list(params or ())
+        if not any(isinstance(p, (tuple, list)) and len(p) == 2 and p[0] == 'currency_pair' for p in pairs):
+            raise not_sent(ValueError('PROBE_CURRENCY_PAIR_REQUIRED'))
+        if (isinstance(expired_ms, bool) or not isinstance(expired_ms, int) or expired_ms <= 0
+                or expired_ms > int(time.time() * 1000) - 1000):
+            raise not_sent(ValueError('PROBE_EXPTIME_MUST_BE_IN_THE_PAST'))
+        return self._request('DELETE', f'/spot/orders/{oid}', pairs, None, signed=True, bucket=None,
+                             emergency=None, expire=None, cost=1, exptime_override_ms=expired_ms)
+
     def diagnostics(self) -> dict:
         with self._diag_lock:
             return {
@@ -338,10 +362,14 @@ class GateRestClient:
         return {'KEY': self._key or '', 'Timestamp': timestamp, 'SIGN': sign}
 
     def _request(self, method: Any, path: Any, params: Any, body: Any, *, signed: bool, bucket: str | None,
-                 emergency: bool | None, expire: bool | None, cost: int) -> Any:
+                 emergency: bool | None, expire: bool | None, cost: int,
+                 exptime_override_ms: int | None = None) -> Any:
         try:
             prepared = self._prepare(method, path, params, body, signed=signed, bucket=bucket,
                                      emergency=emergency, expire=expire)
+            if exptime_override_ms is not None and not (
+                    prepared.method == 'DELETE' and prepared.expire and prepared.group == '/spot/orders/{order_id}'):
+                raise ValueError('EXPTIME_OVERRIDE_NOT_ALLOWED')   # probe_expired_exptime only
         except Exception as exc:
             raise not_sent(exc) from None
         if not prepared.write and self.before_read is not None:
@@ -366,7 +394,8 @@ class GateRestClient:
                 self._last_signed_ms = max(self._last_signed_ms, now_ms)
                 headers.update(self._sign_headers(prepared, now))
             if prepared.expire:
-                headers[EXPTIME_HEADER] = str(now_ms + self.request_expiry_ms)
+                expires = now_ms + self.request_expiry_ms if exptime_override_ms is None else exptime_override_ms
+                headers[EXPTIME_HEADER] = str(expires)
         started = time.monotonic()
         try:
             data = None if prepared.payload is None else prepared.payload.encode('utf-8')

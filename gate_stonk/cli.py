@@ -2,12 +2,14 @@
 
 Commands: ``validate``, ``doctor``, ``index-watch``, ``run``, ``cancel-only``, ``status``,
 ``report``, ``simulate`` (offline run of the real engine on a SYNTHETIC market, see
-:mod:`gate_stonk.simulate`). ``--config`` is accepted before or after the command. Human
-output is Russian.
+:mod:`gate_stonk.simulate`), ``smoke-test`` (live: one far post-only order, reads, cancel,
+DMS; see :mod:`gate_stonk.smoke`). ``--config`` is accepted before or after the command.
+Human output is Russian.
 
-Exit codes: 0 success; 1 invalid configuration, failed doctor check, missing status/database;
-2 refusal or error (live gates, lock held, unverified cancel-only, unexpected exception);
-130 interrupted before a command could clean up.
+Exit codes: 0 success; 1 invalid configuration, failed doctor check, missing status/database,
+failed smoke-test step (also a requested ``--dms-fire`` not performed after the main flow);
+2 refusal or error (live gates, lock held, smoke-test refusal while no order was sent,
+unverified cancel-only, unexpected exception); 130 interrupted before a command could clean up.
 
 ``run`` ports the reference runner (notes/ref_config_cli_ops.md §2.6-2.8):
 
@@ -594,11 +596,16 @@ def iceberg_levels(cfg: Config) -> list[str]:
             for level in cfg.levels(side) if level.has_iceberg]
 
 
-def run_gate_refusal(cfg: Config, live_flag: bool, seconds: float | None) -> tuple[str, str] | None:
-    """Local refusal (code, Russian text) in the binding order, or None. No network, no files."""
+def run_gate_refusal(cfg: Config, live_flag: bool, seconds: float | None, *, telegram: bool = True,
+                     iceberg: bool = True, command: str = 'run') -> tuple[str, str] | None:
+    """Local refusal (code, Russian text) in the binding order, or None. No network, no files.
+
+    ``smoke-test`` reuses the same gates in the same order with ``telegram=False`` (it does
+    not need the Telegram channel) and ``iceberg=False`` (it never sends iceberg orders).
+    """
     if cfg.live and not live_flag:
         return ('LIVE_CONFIG_REQUIRES_EXPLICIT_RUN_LIVE_FLAG',
-                'app.mode: live требует явного флага: run --live.')
+                f'app.mode: live требует явного флага: {command} --live.')
     if live_flag and not cfg.live:
         return ('LIVE_FLAG_REQUIRES_APP_MODE_LIVE',
                 'Флаг --live задан, но в конфиге app.mode: paper. Для live установите app.mode: live.')
@@ -620,13 +627,13 @@ def run_gate_refusal(cfg: Config, live_flag: bool, seconds: float | None) -> tup
         return ('DEAD_MAN_SWITCH_REQUIRED', 'Live требует safety.dead_man_switch: true.')
     if not cfg.secrets.has_gate_keys:
         return ('GATE_API_KEYS_MISSING', 'Не заданы GATE_API_KEY / GATE_API_SECRET (в .env рядом с конфигом).')
-    if cfg.safety['require_telegram']:
+    if telegram and cfg.safety['require_telegram']:
         if not cfg.telegram['enabled']:
             return ('TELEGRAM_REQUIRED_BUT_DISABLED',
                     'safety.require_telegram: true, но telegram.enabled: false.')
         if not cfg.secrets.has_telegram:
             return ('TELEGRAM_CREDENTIALS_MISSING', 'Не заданы TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.')
-    icebergs = iceberg_levels(cfg)
+    icebergs = iceberg_levels(cfg) if iceberg else []
     if icebergs and not cfg.execution['iceberg_poc_verified']:
         return (ICEBERG_CODE,
                 f"Уровни {', '.join(icebergs)} заданы как iceberg, а execution.iceberg_poc_verified: false. "
@@ -1362,6 +1369,52 @@ def cmd_simulate(cfg: Config, args: argparse.Namespace, deps: Deps) -> int:
     return simulate(cfg, args, deps)
 
 
+# ============================================================================ smoke-test
+
+def cmd_smoke_test(cfg: Config, args: argparse.Namespace, deps: Deps) -> int:
+    """Live smoke test (gate_stonk.smoke): one far post-only BUY, reads, cancel, reads, DMS.
+
+    Order of refusals: arguments, then the SAME live gates as ``run`` in the same order
+    (Telegram and the iceberg flag are not needed: no Telegram, no iceberg), then paper is
+    refused, then the bot's process locks (a running bot or a second smoke test refuses).
+    With ``deps.signals`` the run handles SIGTERM / SIGBREAK like Ctrl+C (``SmokeTest.run``
+    installs the handlers for its duration): cleanup, verification and the report still run.
+    """
+    from .smoke import EXIT_REFUSED, LEVEL_ID, SmokeOptions, option_refusal, run_smoke
+
+    def refuse(code: str, message: str) -> int:
+        deps.error(f'Smoke-тест отклонён ({code}): {message}')
+        return EXIT_REFUSED
+
+    try:
+        options = SmokeOptions(edge_pct=D(args.edge_pct), max_notional=D(args.max_notional),
+                               index_seconds=float(args.index_seconds), dms_fire=bool(args.dms_fire),
+                               probe_exptime=bool(args.probe_exptime))
+    except (ValueError, TypeError):
+        return refuse('SMOKE_ARGUMENT_INVALID', '--edge-pct, --max-notional и --index-seconds должны быть числами.')
+    refusal = option_refusal(options)
+    if refusal is None:
+        refusal = run_gate_refusal(cfg, bool(args.live), None, telegram=False, iceberg=False, command='smoke-test')
+    if refusal is None and not cfg.live:
+        refusal = ('SMOKE_TEST_LIVE_ONLY', 'smoke-test работает только в live: app.mode: live и флаг --live '
+                                           '(используйте отдельный config.live.yaml).')
+    if refusal is None and any(level.id == LEVEL_ID for level in cfg.all_levels()):
+        refusal = ('SMOKE_LEVEL_ID_CONFLICT', f'в конфиге есть уровень с id "{LEVEL_ID}": его text совпал бы с '
+                                              'text smoke-заявок. Переименуйте уровень.')
+    if refusal is not None:
+        return refuse(*refusal)
+    handlers = configure_logging(cfg, console_level=logging.ERROR) if deps.logging else []
+    try:
+        with ProcessLocks(cfg, live=True):
+            LOG.warning('LIVE smoke-test: %s, аккаунт %s', cfg.currency_pair, cfg.market['account'])
+            return run_smoke(cfg, options, deps)
+    except LockBusy as exc:
+        return refuse('LOCK_HELD', f'запущен другой процесс gate_stonk (занята блокировка {exc.path}). Остановите '
+                                   'бота: smoke-тест идёт только на пустой паре и без работающего бота.')
+    finally:
+        remove_logging(handlers)
+
+
 # ============================================================================ parser / main
 
 COMMANDS: dict[str, Callable[[Config, argparse.Namespace, Deps], int]] = {
@@ -1373,6 +1426,7 @@ COMMANDS: dict[str, Callable[[Config, argparse.Namespace, Deps], int]] = {
     'status': cmd_status,
     'report': cmd_report,
     'simulate': cmd_simulate,
+    'smoke-test': cmd_smoke_test,
 }
 
 
@@ -1422,6 +1476,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help='папка результатов (по умолчанию <app.state_dir>/simulation_<seed>; не папка торговли)')
     p.add_argument('--volatility', type=float, default=None,
                    help='волатильность справедливой цены, %% за √часа (по умолчанию 1.5)')
+
+    p = command('smoke-test', 'LIVE smoke-тест: одна дальняя post-only BUY, проверка чтением, отмена, DMS '
+                              '(только после явного «да» заказчика)')
+    p.add_argument('--live', action='store_true', help='явное подтверждение live (нужно; app.mode: live)')
+    p.add_argument('--edge-pct', default='10', help='край от центра индекса, %% (не меньше 10; по умолчанию 10)')
+    p.add_argument('--max-notional', default='10', help='предел суммы заявки, USDT (по умолчанию 10, не больше 100)')
+    p.add_argument('--index-seconds', type=float, default=30.0,
+                   help='сколько ждать валидный индекс и стакан, с (1..600; по умолчанию 30)')
+    p.add_argument('--dms-fire', action='store_true',
+                   help='дополнительно: вторая дальняя заявка и DMS 10 с без продления (Gate должен снять её сам)')
+    p.add_argument('--probe-exptime', action='store_true',
+                   help='дополнительно: отмена несуществующей заявки с x-gate-exptime в прошлом (label просрочки)')
     return parser
 
 

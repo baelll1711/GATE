@@ -35,3 +35,9 @@ independent snippet and compares with notes §1.3.
 
 Re-check every shape against real replies at stage 5 (live read-only checks) and replace values
 that turn out different; keep the `_comment` marker until a file is a real recording.
+
+Real recordings go to `recorded/` (created on the first promotion), never into this folder: the
+venue tests assert the `SYNTHETIC` marker of every file they read from here. `python -m gate_stonk smoke-test` saves each
+sanitized Gate reply as a candidate fixture under `<state_dir>/smoke/fixtures/<UTC>/` in this same
+layout, with `_comment` starting `RECORDED` and an extra `_request` block (method, endpoint, query,
+body, HTTP status, label, latency); the `README.md` written next to them explains the promotion.
