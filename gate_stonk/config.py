@@ -197,8 +197,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         'initial_avg_price': None,
     },
     'side': {
-        'band_tolerance_pct': Decimal('0.15'),
-        'reprice_threshold_pct': Decimal('0.15'),
+        'band_tolerance_pct': Decimal('0.5'),
+        'reprice_threshold_pct': Decimal('0.5'),
         'min_reprice_seconds': 3,
         'deeper_tolerance_pct': None,
     },

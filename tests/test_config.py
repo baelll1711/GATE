@@ -112,8 +112,8 @@ def test_example_loads_with_expected_levels(tmp_path, sample):
     assert b2.iceberg_display_pct == Decimal('25') and b2.has_iceberg
     assert b1.slot == 'buy:b1' and sell[1].slot == 'sell:s2'
     for lvl in buy + sell:   # side defaults inherited
-        assert lvl.band_tolerance_pct == Decimal('0.15')
-        assert lvl.reprice_threshold_pct == Decimal('0.15')
+        assert lvl.band_tolerance_pct == Decimal('0.5')
+        assert lvl.reprice_threshold_pct == Decimal('0.5')
         assert lvl.min_reprice_seconds == Decimal('3') and isinstance(lvl.min_reprice_seconds, Decimal)
         assert lvl.deeper_tolerance_pct is None
         assert lvl.skip_notional_usdt == 0
@@ -190,7 +190,7 @@ def test_side_settings_include_limits_and_cross_side_keys(tmp_path, sample):
     buy, sell = cfg.side('buy'), cfg.side('sell')
     assert buy['max_daily_notional_usdt'] == Decimal('200') and sell['max_daily_notional_usdt'] is None
     assert buy['max_total_qty'] is None and buy['max_total_notional_usdt'] is None
-    assert buy['band_tolerance_pct'] == Decimal('0.15') and buy['min_reprice_seconds'] == Decimal('3')
+    assert buy['band_tolerance_pct'] == Decimal('0.5') and buy['min_reprice_seconds'] == Decimal('3')
     assert buy['compensate_base_fee'] is False and buy['min_profit_pct'] is None
     assert sell['min_profit_pct'] is None and sell['profit_floor_mode'] == 'hold'
     assert sell['compensate_base_fee'] is False and buy['profit_floor_mode'] == 'hold'
@@ -639,7 +639,7 @@ def test_level_overrides_and_inheritance(tmp_path, sample):
     cfg = load_sample(tmp_path, sample)
     b1, b2 = cfg.levels('buy')
     assert b1.deeper_tolerance_pct is None and b2.deeper_tolerance_pct == Decimal('0.4')
-    assert b1.band_tolerance_pct == Decimal('0.15') and b2.band_tolerance_pct == Decimal('0.3')
+    assert b1.band_tolerance_pct == Decimal('0.5') and b2.band_tolerance_pct == Decimal('0.3')
     assert b2.reprice_threshold_pct == Decimal('0.2') and b2.min_reprice_seconds == Decimal('10')
     assert all(lvl.min_reprice_seconds == Decimal('1.5') for lvl in cfg.levels('sell'))
     # the normalized data keeps the null override, so re-validation gives the same levels

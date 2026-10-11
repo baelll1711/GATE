@@ -95,8 +95,8 @@ pair:
   inventory_reserve_qty: 0          # токены, которые нельзя продавать
   initial_avg_price: null           # себестоимость токенов, бывших до бота
   buy:
-    band_tolerance_pct: 0.15
-    reprice_threshold_pct: 0.15
+    band_tolerance_pct: 0.5         # допуск до немедленного снятия (PREMIUM_RANGE_CHANGED); hard_min_edge не ослабляет
+    reprice_threshold_pct: 0.5      # перестановка REPRICE, если цель ушла дальше; тик ≈ 0.074%
     min_reprice_seconds: 3
     deeper_tolerance_pct: null
     max_total_qty: null
@@ -111,8 +111,8 @@ pair:
       - {id: b1, edge_pct: 1.0, order_notional_usdt: 20, iceberg_display_qty: null}
       - {id: b2, edge_pct: 2.0, order_notional_usdt: 30, iceberg_display_pct: 25}
   sell:
-    band_tolerance_pct: 0.15
-    reprice_threshold_pct: 0.15
+    band_tolerance_pct: 0.5
+    reprice_threshold_pct: 0.5
     min_reprice_seconds: 3
     deeper_tolerance_pct: null
     max_total_qty: null

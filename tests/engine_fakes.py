@@ -529,11 +529,19 @@ class FakeNotifier:
 
 # ============================================================================ config / rig
 def config_data(overrides: dict | None = None, *, mode: str = 'paper') -> dict:
-    """config.example.yaml without the USDC (Lighter) source, plus dotted-key overrides."""
+    """config.example.yaml without the USDC (Lighter) source, plus dotted-key overrides.
+
+    The engine tests' price scenarios are written for a 0.15 % band tolerance and reprice
+    threshold, so both sides are pinned to that baseline whatever the example ships with;
+    a test that needs other values overrides them like any other key.
+    """
     data = yaml.safe_load(EXAMPLE.read_text(encoding='utf-8'))
     data['index']['sources'] = [s for s in data['index']['sources'] if s['quote'] == 'USDT']
     data['app']['mode'] = mode
     data['telegram']['summary_minutes'] = None
+    for side in ('buy', 'sell'):
+        data['pair'][side]['band_tolerance_pct'] = 0.15
+        data['pair'][side]['reprice_threshold_pct'] = 0.15
     for dotted, value in (overrides or {}).items():
         node = data
         parts = dotted.split('.')
